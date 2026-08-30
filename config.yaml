@@ -1,0 +1,122 @@
+# =============================================================================
+# BoVW / CNN comparison framework — example configuration
+# =============================================================================
+# Every field here is validated by src/config.py (pydantic). Unknown or
+# mistyped fields will raise a clear validation error at startup rather than
+# failing silently deep in the pipeline.
+
+# Name used in every output path (outputs/preprocessed/<dataset_name>/, ...).
+# No spaces allowed. Ignored in multi-dataset mode (paths.datasets_root set):
+# each discovered dataset uses its own subfolder name instead.
+dataset_name: flowers17
+
+paths:
+  # SINGLE-DATASET MODE: root folder containing one sub-folder per class:
+  #   dataset_dir/<class_name>/<image>.jpg
+  dataset_dir: data/flowers17
+  # MULTI-DATASET MODE: instead, point this at a folder containing several
+  # datasets (each laid out as above) to run the full comparison on every
+  # one of them in a single invocation. Overrides dataset_dir/dataset_name
+  # when set (also settable at the CLI via --datasets-root):
+  #   datasets_root: data/all_datasets
+  datasets_root: null
+  output_dir: outputs
+  logs_dir: outputs/logs
+
+preprocessing:
+  target_size: [128, 128]      # [H, W], per spec section 2.1
+  clahe_clip_limit: 2.0
+  clahe_tile_grid_size: [8, 8]
+  batch_size: 64                # images processed per batch (progress granularity)
+
+feature_extraction:
+  sift:
+    n_features: 0               # 0 = no cap (OpenCV default)
+    contrast_threshold: 0.04
+    edge_threshold: 10.0
+  cnn:
+    backbone: googlenet         # only googlenet (Inception v1) is supported
+    pretrained: true
+    layer_name: inception4e     # intermediate conv layer -> local descriptors for BoVW
+    device: auto                 # auto | cpu | cuda
+    batch_size: 32
+  # === ViT (option B): config for the `vit_end_to_end` approach =========
+  vit:
+    backbone: vit_b_16          # torchvision ViT-B/16 (no extra dependency)
+    pretrained: true
+    device: auto                 # auto | cpu | cuda
+    batch_size: 32
+  # === fin ViT (option B) ================================================
+
+vocabulary:
+  k: 256                        # visual vocabulary size (number of clusters);
+                                 # for bovw_baseline/cnn_bovw, K-means runs
+                                 # directly on D with this K. For bovw_cvws/
+                                 # cnn_bovw_cvws, this is instead the FINAL
+                                 # K-means size in step 4 of the CVWS pipeline
+                                 # (run on the selected candidates, not on D).
+  seed: 42
+  minibatch: true                # MiniBatchKMeans (scalable) vs. exact KMeans
+  minibatch_batch_size: 1000
+  max_iter: 100
+  # Step 2 of the CVWS pipeline ("Réduction de redondance par clustering
+  # hiérarchique (Mean Shift)") -- only used by bovw_cvws/cnn_bovw_cvws;
+  # bovw_baseline/cnn_bovw ignore this entirely.
+  mean_shift:
+    quantile: 0.3                # passed to sklearn's estimate_bandwidth(); no subsampling
+    bin_seeding: true             # sklearn speed optimization, not subsampling
+
+selection:
+  # The 3 candidate-scoring strategies from "Stratégie de sélection des
+  # mots visuels" (Epadie, Aug. 2026), applied in step 3 of the CVWS
+  # pipeline (see README section 7). Each assigns every Mean-Shift
+  # candidate v to the class c*(v) = argmax_c score(v,c), then keeps only
+  # the n_candidates_per_class highest-scoring candidates within each
+  # class's assigned set. One full run of steps 3-5 happens per strategy
+  # listed here.
+  strategies:
+    - global_class_frequency              # Méthode 1 (GCF): score = S_GCF(v,c)
+    - intra_class_corverage    # Méthode 2 (ICC): score = S_GCF(v,c) * H_intra(v,c)
+    - class_exclusivity_discriminatve             # Méthode 3 (CED): score = S_ICC(v,c) * (1 - H_inter(v))
+  # n in "les n meilleurs candidats de chaque classe" (step 3). Explicit
+  # and required -- operates on the Mean-Shift candidate space, whose size
+  # is data-dependent and not derivable from vocabulary.k alone.
+  n_candidates_per_class: 50
+
+classifiers:
+  enabled:
+    - mlp
+    - svc
+    - decision_tree
+    - logistic_regression
+    - xgboost
+    - naive_bayes
+  logistic_regression_max_iter: 1000   # documented exception to "sklearn defaults"
+  naive_bayes_variant: multinomial     # multinomial (counts) | gaussian
+
+metrics:
+  enabled:
+    - accuracy
+    - f1_macro
+    - recall_macro
+    - auc_macro_ovr
+
+approaches:
+  enabled:
+    - bovw_baseline
+    - bovw_cvws
+    - cnn_bovw
+    - cnn_bovw_cvws
+    - vit_cvws
+    - cnn_end_to_end
+    - vit_end_to_end
+
+runtime:
+  seed: 42
+  test_size: 0.2
+  n_jobs: -1
+  # null (default) = deterministic "<dataset_name>_<config_content_hash>".
+  # Re-running the framework with an unchanged config reuses this same id,
+  # and therefore every cached artifact (see README section 5). Set an
+  # explicit string only if you need to force/target a specific run.
+  run_id: null

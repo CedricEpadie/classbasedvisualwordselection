@@ -1,0 +1,123 @@
+# ==========================================
+# .gitignore for Bovw_framework_vit
+# (Bag-of-Visual-Words + Vision Transformer / PyTorch)
+# ==========================================
+
+# ------------------------------------------
+# 1. Project-Specific Output & Data Directories
+# ------------------------------------------
+outputs/*
+!outputs/.gitkeep
+
+# Cache & Local Storage for Feature Extraction / Vocabulary / Models
+cache/
+data/
+checkpoints/
+*.pth
+*.pt
+*.onnx
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.h5
+
+# ------------------------------------------
+# 2. Python & Bytecode
+# ------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ------------------------------------------
+# 3. Virtual Environments
+# ------------------------------------------
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+bin/
+
+# ------------------------------------------
+# 4. Jupyter Notebooks & Data Science Tracking
+# ------------------------------------------
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+.hydra/
+wandb/
+mlruns/
+tensorboard/
+runs/
+
+# ------------------------------------------
+# 5. IDEs & Code Editors
+# ------------------------------------------
+# VS Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+# PyCharm / JetBrains
+.idea/
+*.iml
+
+# Vim / Emacs / Backup files
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# ------------------------------------------
+# 6. Testing, Coverage & Quality Assurance
+# ------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.nox/
+.tox/
+.hypothesis/
+.cache
+
+# ------------------------------------------
+# 7. OS & System Files
+# ------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ------------------------------------------
+# 8. Environment Variables & Secrets
+# ------------------------------------------
+.env
+.env.*
+!.env.example
