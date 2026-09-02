@@ -6,10 +6,10 @@ classification approaches on one or many datasets:
 | # | Approach key          | Pipeline |
 |---|------------------------|----------|
 | 1 | `bovw_baseline`        | preprocessing → SIFT → K-means (direct on D) → histograms → classifiers |
-| 2 | `bovw_cvws`            | preprocessing → SIFT → 5-step CVWS candidate pipeline (§7) → classifiers |
+| 2 | `bovw_cvws`            | preprocessing → SIFT → 11-step CVWS pipeline (§7) → classifiers |
 | 3 | `cnn_bovw`             | preprocessing → GoogleNet local features → K-means (direct on D) → histograms → classifiers |
-| 4 | `cnn_bovw_cvws`        | ("Ma Méthode") preprocessing → GoogleNet local features → 5-step CVWS candidate pipeline (§7) → classifiers |
-| 5 | `vit_cvws`             | preprocessing → ViT-B/16 patch-token local features → 5-step CVWS candidate pipeline (§7) → classifiers |
+| 4 | `cnn_bovw_cvws`        | ("Ma Méthode") preprocessing → GoogleNet local features → 11-step CVWS pipeline (§7) → classifiers |
+| 5 | `vit_cvws`             | preprocessing → ViT-B/16 patch-token local features → 11-step CVWS pipeline (§7) → classifiers |
 | 6 | `cnn_end_to_end`       | preprocessing → GoogleNet global pooled vector → classifiers — no BoVW/vocabulary step |
 | 7 | `vit_end_to_end`       | preprocessing → Vision Transformer (ViT-B/16) `[CLS]` embedding → classifiers — no BoVW/vocabulary step |
 
@@ -42,8 +42,9 @@ src/
 ├── config.py                # pydantic-validated YAML config, content hashing, CLI overrides
 ├── preprocessing.py         # resize + CLAHE contrast enhancement
 ├── feature_extraction.py    # SIFT + GoogleNet local/global + ViT (local patch-token/global CLS) extractors
-├── vocabulary.py            # K-means vocabulary, Mean Shift candidate reduction, histogram encoding, VocabularyStats
-├── selection_strategies.py  # Strategy pattern: Methods 1, 2, 3 (GCF/ICC/CED, argmax candidate→class assignment)
+├── vocabulary.py            # K-means vocabulary (+ cosine metric), histogram encoding, VocabularyStats
+├── cvws_clustering.py       # CVWS pipeline steps 3-8: UMAP, HDBSCAN, symbolic re-encoding, candidate reconstruction
+├── selection_strategies.py  # Strategy pattern: Methods 1, 2, 3 (GCF/ICC/CED, independent per-class Top-N ranking)
 ├── classifiers.py           # ClassifierWrapper around MLP/SVC/DT/LogReg/XGBoost/NB
 ├── metrics_engine.py        # Registry pattern, computed from stored predictions only
 ├── pipeline_state.py        # Checkpointing / crash recovery (StepStatus, state.json)
@@ -55,6 +56,8 @@ src/
 
 tests/
 ├── test_selection_strategies.py
+├── test_vocabulary.py
+├── test_cvws_clustering.py
 └── test_metrics_engine.py
 
 config.yaml            # example, fully commented config
@@ -176,19 +179,20 @@ recomputing gets recomputed.** This works on two levels:
    the exact same id, so its predictions/metrics/comparison files are
    reused rather than duplicated under a fresh name.
 2. **Per-step, per-dataset granular cache.** `outputs/state/pipeline_state_<dataset_name>.json`
-   tracks each step (preprocessing, feature extraction, K-means, Mean
-   Shift reduction, candidate selection, per-classifier training, ...)
+   tracks each step (preprocessing, feature extraction, K-means, UMAP/HDBSCAN
+   clustering, candidate selection, per-classifier training, ...)
    independently, each keyed by a hash of *only the config section(s)
    that step actually depends on* — not the whole config. Concretely:
    * Preprocessing only reruns if `preprocessing` changed.
    * Feature extraction only reruns if `feature_extraction` changed.
    * `bovw_baseline`/`cnn_bovw`'s direct K-means vocabulary + histograms
      only rerun if `vocabulary` or `feature_extraction` changed.
-   * `bovw_cvws`/`cnn_bovw_cvws`'s Mean Shift reduction only reruns if
-     `vocabulary` (its `mean_shift.*` fields) or `feature_extraction`
-     changed; per-strategy candidate selection and the resulting final
-     K-means/histograms only rerun if `selection`, `vocabulary`, or
-     `feature_extraction` changed.
+   * `bovw_cvws`/`cnn_bovw_cvws`/`vit_cvws`'s UMAP+HDBSCAN clustering
+     (steps 3-5) and per-class cluster stats (step 6) only rerun if
+     `vocabulary` (its `umap.*`/`hdbscan.*` fields) or `feature_extraction`
+     changed; per-strategy candidate selection/reconstruction (steps 7-8)
+     and the resulting final K-means/histograms (steps 9-10) only rerun if
+     `selection`, `vocabulary`, or `feature_extraction` changed.
    * A given classifier's training only reruns if something that actually
      feeds its `X_train`/`X_test`/hyperparameters changed — critically,
      **not** when you simply add or remove a different classifier from
@@ -240,39 +244,73 @@ every classifier) or recompute for existing runs with
 
 Unlike `bovw_baseline`/`cnn_bovw` (K-means run directly on the full
 descriptor set), `bovw_cvws`/`cnn_bovw_cvws`/`vit_cvws` build their
-vocabulary through a 5-step pipeline that lets per-class discriminability
-shape *which descriptors feed the final quantization*, rather than
-filtering an already-built vocabulary after the fact:
+vocabulary through an 11-step pipeline ("Pipeline de construction d'un
+vocabulaire visuel par sélection de mots visuels basée sur la classe",
+C. Epadie, Aug. 2026) that lets per-class discriminability shape *which
+descriptors feed the final quantization*, rather than filtering an
+already-built vocabulary after the fact:
 
-1. **Local descriptor extraction.** Each image is represented by a set of
+1. **Preprocessing.** Every image is resized to 224×224 and contrast-enhanced.
+2. **Local descriptor extraction.** Each image is represented by a set of
    local descriptors: SIFT (`bovw_cvws`), GoogleNet intermediate-layer
    activations (`cnn_bovw_cvws`), or ViT-B/16 patch tokens, i.e. every
    patch embedding excluding `[CLS]` (`vit_cvws`, `ViTExtractor`'s
    `"local"` mode). Their union over the whole corpus is the descriptor
-   space `D`.
-2. **Redundancy reduction (Mean Shift).** Mean Shift clusters every
-   training descriptor in `D` (bandwidth auto-estimated via scikit-learn's
-   `estimate_bandwidth`, no subsampling — see `vocabulary.mean_shift.*` in
-   `config.yaml`). The resulting centroids are the reduced, representative
-   *candidate* descriptors for step 3.
-3. **Per-class discriminative selection.** For each class `C`, its
-   candidates are scored with one of the three strategies below and the
-   `n_candidates_per_class` best-scoring ones are kept. Selection is
-   independent per class, so a candidate can be kept by more than one
-   class — the retained sets are not necessarily disjoint. One full run
-   of steps 3-5 happens per entry in `selection.strategies`.
-4. **Final quantization (K-means).** All retained candidates, across
-   every class, are pooled and clustered with K-means (`K = vocabulary.k`
-   — the *same* K used by `bovw_baseline`/`cnn_bovw`'s direct K-means, so
-   approaches stay comparable at equal feature dimension). The resulting
+   space `D`. Each descriptor's image of origin is kept (provenance),
+   needed to map candidates back to their original vectors in step 9.
+3. **Dimensionality reduction (UMAP).** Every TRAINING descriptor in `D`
+   is projected to a `vocabulary.umap.n_components`-dimensional space
+   (default 10). The correspondence between each reduced vector and its
+   original descriptor is preserved.
+4. **Unsupervised clustering (HDBSCAN, cosine).** HDBSCAN clusters the
+   UMAP-reduced descriptors, with `min_cluster_size`/`min_samples`
+   expressed as percentages of the descriptor count
+   (`vocabulary.hdbscan.min_cluster_size_pct`/`min_samples_pct`) so they
+   scale with corpus size. Neither HDBSCAN nor the final K-means (step 9)
+   support cosine distance natively in scikit-learn (HDBSCAN's cosine mode
+   forces an O(N²) brute-force search; K-means has no cosine variant at
+   all), so both are implemented via the standard, mathematically
+   equivalent trick of L2-normalizing vectors and running the plain
+   Euclidean algorithm (`vocabulary.l2_normalize`) — see
+   `cvws_clustering.py`'s module docstring for the full rationale.
+5. **Noise removal.** Descriptors HDBSCAN labels as noise (`-1`) are dropped.
+6. **Symbolic re-encoding.** Each training image is re-encoded as its
+   per-cluster occurrence counts (each surviving descriptor is replaced by
+   its cluster id) — this reuses `vocabulary.VocabularyStats` directly, no
+   nearest-centroid search needed, since HDBSCAN already gives every
+   surviving descriptor a hard cluster assignment.
+7. **Per-class discriminative selection.** For each class `C`,
+   *independently*, its clusters are ranked by one of the three strategies
+   below (`score(v, C)` for `C` alone — no comparison against any other
+   class) and the `n_candidates_per_class` best-scoring ones are kept. A
+   cluster id can therefore legitimately be selected by several classes at
+   once — the retained sets are not necessarily disjoint, and no longer an
+   argmax-based partition.
+8. **Weighted candidate reconstruction.** A cluster selected by
+   `selection_count` distinct classes (i.e. it appears in that many
+   classes' Top-N from step 7) contributes its `selection_count`
+   highest-HDBSCAN-probability member descriptors (nearest its medoid) to
+   the final candidate pool — so a cluster several classes value
+   contributes proportionally more representative descriptors. If
+   `selection_count` exceeds a cluster's own member count, every member is
+   kept (clamped).
+9. **Return to the original space + final quantization.** The selected
+   candidates, originally identified in UMAP space, are mapped back to
+   their ORIGINAL (pre-UMAP) descriptor vectors via the provenance kept in
+   step 2, then K-means (cosine, `K = vocabulary.k` — the *same* K used by
+   `bovw_baseline`/`cnn_bovw`'s direct K-means, so approaches stay
+   comparable at equal feature dimension) is run on them. The resulting
    centroids are the final vocabulary `V = {v1, ..., vK}`.
-5. **Image encoding.** Every image (train and test) is finally encoded as
-   its BoVW frequency histogram over `V`.
+10. **Image encoding.** Every image (train and test) is finally encoded as
+    its BoVW frequency histogram over `V`.
+11. **Classification.** The histograms feed the same classifiers as every
+    other approach.
 
-`src/selection_strategies.py` implements the three step-3 scoring methods
+`src/selection_strategies.py` implements the three step-7 scoring methods
 from *"Stratégie de sélection des mots visuels"* (C. Epadie, Aug. 2026).
-Each is an **assignment**: every candidate `v` is assigned to the single
-class `c*(v)` maximizing a score, `c*(v) = argmax_c score(v,c)`:
+Selection is **independent per class**: `select_top_n(stats, class_label,
+n)` ranks `score_matrix(stats)[class_label]` on its own and keeps the top
+`n`, with no comparison against any other class:
 
 | Method | Config name | Score `score(v, C)` |
 |---|---|---|
@@ -286,36 +324,33 @@ across the images of `C` (→ 1 if spread uniformly over every image of
 `C`, → 0 if confined to a single image), and `H_inter(v)` is the
 normalized Shannon entropy of `v`'s distribution **across classes** (→ 1
 if spread evenly over every class — generic, non-discriminant — → 0 if
-`v` is exclusive to one class). Note `H_inter`, and therefore the
+`v` is exclusive to one class). `H_inter`, and therefore the
 discriminability factor `1 − H_inter(v)`, is a single global value per
-candidate, not per class: it can only rescale `S_ICC`'s per-candidate
-class ranking, never flip it.
+candidate (not per class) — but since it multiplies each class's
+`S_ICC(v, ·)` by a WORD-specific (not class-specific) constant, CED *can*
+reorder a class's own ranking of different candidates relative to ICC
+(unlike a class-invariant rescaling): a candidate with high `S_ICC` but
+that's also generic across classes (`D(v)` near 0) can rank below one with
+lower `S_ICC` but strong class exclusivity (`D(v)` near 1).
 
 **`n_candidates_per_class` (`selection.n_candidates_per_class`, explicit,
-required).** Selection alone (uncapped) is a *partition* of the candidate
-set (every candidate assigned to exactly one class), so `S(c1) ∪ S(c2) ∪
-... = ` the full candidate set. Capping each class's assigned set to its
-`n_candidates_per_class` highest-scoring members before taking the union
-is what actually reduces the pool of descriptors handed to the final
-K-means (step 4) below the full candidate count — this is a mandatory
-config field with no auto-derived default: the Mean-Shift candidate
-count is data-dependent, unlike the old (removed) `top_n = vocabulary_size
-// n_classes` heuristic which operated on the final vocabulary's own,
-known-in-advance size. If the selected union ends up smaller than
-`vocabulary.k`, the final K-means (step 4) raises a clear error asking you
-to raise `n_candidates_per_class` or lower `vocabulary.k`. The full
-(uncapped) per-class assignment is still persisted in
-`outputs/selection/*.json`'s `per_class_assignment` for
-interpretability/auditing, alongside the capped `selected_indices` union
-actually fed to step 4.
+required).** This is a mandatory config field with no auto-derived
+default: the HDBSCAN cluster count is data-dependent, unlike the old
+(removed) `top_n = vocabulary_size // n_classes` heuristic which operated
+on the final vocabulary's own, known-in-advance size. If the reconstructed
+candidate pool (step 8) ends up smaller than `vocabulary.k`, the final
+K-means (step 9) raises a clear error asking you to raise
+`n_candidates_per_class` or lower `vocabulary.k`. The per-class selected
+cluster ids and per-cluster `selection_count`/`cluster_size`/`n_taken` are
+persisted in `outputs/selection/*.json` for interpretability/auditing.
 
 ### Adding a new selection strategy
 
-Subclass `VisualWordSelectionStrategy` and implement `score_matrix`
-(the shared `assign`/`select`/`select_top_n` argmax logic is inherited, no
-need to touch it). If your strategy needs per-image data like ICC/CED do,
-use `vocabulary_stats.per_class_matrix[c]` (shape `(N_c, K)`, raw
-per-image candidate counts); if aggregate counts suffice, like GCF, use
+Subclass `VisualWordSelectionStrategy` and implement `score_matrix` (the
+shared `select_top_n` ranking logic is inherited, no need to touch it). If
+your strategy needs per-image data like ICC/CED do, use
+`vocabulary_stats.per_class_matrix[c]` (shape `(N_c, K)`, raw per-image
+candidate counts); if aggregate counts suffice, like GCF, use
 `vocabulary_stats.F[c]` (shape `(K,)`):
 
 ```python
@@ -330,23 +365,21 @@ class MyStrategy(VisualWordSelectionStrategy):
 Register it in `_STRATEGIES` (same file), then add `"my_strategy"` to
 `selection.strategies` in `config.yaml`.
 
----
-
 ## 8. Output layout
 
 ```
 outputs/
 ├── preprocessed/<dataset>/<image_id>.npy
-├── features/<dataset>_sift/ | <dataset>_googlenet_<layer>/ | <dataset>_vit_<backbone>/
+├── features/<dataset>_sift/ | <dataset>_googlenet_<layer>/ | <dataset>_vit_<backbone>/ | <dataset>_vit_<backbone>_local/
 ├── vocabulary/<dataset>_<tag>_k<K>_seed<seed>.pkl                        # bovw_baseline/cnn_bovw: direct K-means
-├── vocabulary/<dataset>_<tag>_meanshift_candidates.pkl                   # *_cvws step 2: Mean Shift candidates
-├── vocabulary/<dataset>_<tag>_strategy-<name>_k<K>_seed<seed>.pkl        # *_cvws step 4: final vocabulary (per strategy)
+├── vocabulary/<dataset>_<tag>_umap_hdbscan.pkl                           # *_cvws steps 3-5: ClusteringResult
+├── vocabulary/<dataset>_<tag>_strategy-<name>_k<K>_seed<seed>.pkl        # *_cvws step 9: final vocabulary (per strategy, cosine)
 ├── vocabulary_stats/<dataset>_<tag>_k<K>_seed<seed>.pkl                  # bovw_baseline/cnn_bovw: per-class F(w,c)/DF(w,c) cache
-├── vocabulary_stats/<dataset>_<tag>_meanshift_candidates.pkl             # *_cvws step 3: per-class candidate stats (F/DF/per_class_matrix)
+├── vocabulary_stats/<dataset>_<tag>_umap_hdbscan.pkl                     # *_cvws step 6: per-class cluster stats (F/DF/per_class_matrix)
 ├── histograms/<dataset>_<tag>_k<K>_seed<seed>/<image_id>.npy             # bovw_baseline/cnn_bovw
-├── histograms/<dataset>_<tag>_meanshift_candidates/<image_id>.npy        # *_cvws step 3: candidate histograms (train only)
-├── histograms/<dataset>_<tag>_strategy-<name>_k<K>_seed<seed>/<image_id>.npy  # *_cvws step 5: final histograms (per strategy)
-├── selection/<dataset>_<tag>_strategy-<name>_ncand<N>.json   # per_class_assignment + union of selected candidates
+├── histograms/<dataset>_<tag>_strategy-<name>_k<K>_seed<seed>/<image_id>.npy  # *_cvws step 10: final histograms (per strategy)
+├── selection/<dataset>_<tag>_strategy-<name>_ncand<N>.json               # *_cvws step 7-8: per-class selected cluster ids + per-cluster selection_count/cluster_size/n_taken
+├── selection/<dataset>_<tag>_strategy-<name>_ncand<N>_candidates.npy     # *_cvws step 8: reconstructed candidate descriptors (original space)
 ├── predictions/<approach>_<variant>_<classifier>_<dataset>_<training_hash>.parquet
 ├── metrics/<approach>_<variant>_<classifier>_<dataset>_<training_hash>.json
 ├── comparison/comparison_<dataset>_<run_id>.csv                  # single-dataset mode
@@ -370,11 +403,18 @@ pytest tests/ -v
 
 `test_selection_strategies.py` verifies the entropy-based ICC/CED formulas
 against hand-computed expected values (using `math.log2` directly, mirroring
-the spec), checks the partition property (disjoint, union = full candidate
-set) and the `n_candidates_per_class` cap's dimensionality reduction, and
-confirms CED never flips ICC's per-candidate class ranking.
-`test_metrics_engine.py` verifies the metrics registry and demonstrates
-that adding a metric requires no training-code changes.
+the spec), and demonstrates independent-per-class ranking: the same
+candidate can legitimately appear in more than one class's top-N (the
+"candidate can be selected by several classes" premise of step 8), and CED
+can reorder ICC's within-class ranking since its discriminability factor
+varies per candidate, not per class. `test_vocabulary.py` and
+`test_cvws_clustering.py` cover the final cosine K-means (`Vocabulary`'s
+`metric="cosine"` mode, direction-invariant to descriptor magnitude) and
+the CVWS pipeline's symbolic re-encoding / weighted candidate
+reconstruction (steps 6-8), including the multi-class-overlap and
+cluster-size-clamping edge cases. `test_metrics_engine.py` verifies the
+metrics registry and demonstrates that adding a metric requires no
+training-code changes.
 
 ---
 
@@ -392,8 +432,15 @@ that adding a metric requires no training-code changes.
   or very large batches, swapping in `sklearn.cluster.KMeans.predict` or a
   KD-tree would be a drop-in optimization inside `vocabulary.py`.
 * See section 7 above regarding `selection.n_candidates_per_class`: it is
-  mandatory (no auto-derived default) since the Mean-Shift candidate count
-  is data-dependent, unlike the final vocabulary's known-in-advance size.
+  mandatory (no auto-derived default) since the HDBSCAN cluster count is
+  data-dependent, unlike the final vocabulary's known-in-advance size.
+* UMAP/HDBSCAN and the final cosine K-means are fit on TRAINING descriptors
+  only, consistent with every other vocabulary-building step in this
+  framework — test images are only ever encoded later, against the
+  already-built final vocabulary (step 10).
+* `umap-learn` is only imported lazily, inside `cvws_clustering.reduce_and_cluster`
+  (like `torch`/`torchvision` inside `ViTExtractor`/`CnnExtractor`), so it's
+  only required if a `*_cvws` approach actually runs.
 * `cnn_end_to_end` (raw CNN global pooled-vector classification, no BoVW
   step) and `vit_end_to_end` (raw ViT `[CLS]`-embedding classification,
   also no BoVW step) both skip vocabulary/histogram construction entirely
