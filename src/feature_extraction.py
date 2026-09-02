@@ -160,9 +160,9 @@ class ViTExtractor:
         (N_patches, D) per image -- the ViT analogue of `CnnExtractor`'s
         "local" mode (spatial conv activations reshaped to one row per
         position). Used by `vit_cvws` (see `pipeline.run_vit_cvws`), which
-        feeds these into the same 5-step CVWS candidate pipeline
-        (Mean Shift -> per-class selection -> K-means -> histograms) as
-        `bovw_cvws`/`cnn_bovw_cvws`.
+        feeds these into the same 11-step CVWS pipeline
+        (UMAP -> HDBSCAN -> per-class selection -> cosine K-means ->
+        histograms) as `bovw_cvws`/`cnn_bovw_cvws`.
 
     Implementation note: torchvision's `VisionTransformer.forward` does
     roughly `x = encoder(x); x = x[:, 0]; x = heads(x)`. We hook

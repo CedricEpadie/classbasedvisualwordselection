@@ -83,9 +83,9 @@ selection:
   # by several classes at once. One full run of steps 7-10 happens per
   # strategy listed here.
   strategies:
-    - global_class_frequency              # Méthode 1 (GCF): score = S_GCF(v,c)
-    - intra_class_corverage    # Méthode 2 (ICC): score = S_GCF(v,c) * H_intra(v,c)
-    - class_exclusivity_discriminatve             # Méthode 3 (CED): score = S_ICC(v,c) * (1 - H_inter(v))
+    - GCF              # Méthode 1 (GCF): score = S_GCF(v,c)
+    - ICC    # Méthode 2 (ICC): score = S_GCF(v,c) * H_intra(v,c)
+    - CED             # Méthode 3 (CED): score = S_ICC(v,c) * (1 - H_inter(v))
   # n in "les n meilleurs [identifiants de cluster] de chaque classe"
   # (step 7). Explicit and required -- operates on the HDBSCAN cluster-id
   # space, whose size is data-dependent and not derivable from

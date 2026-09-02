@@ -100,7 +100,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=None,
         metavar="STRATEGY",
-        help="Override selection.strategies (global_class_frequency / intra_class_corverage / class_exclusivity_discriminatve).",
+        help="Override selection.strategies (GCF / ICC / CED).",
     )
     parser.add_argument("--vocabulary-k", type=int, default=None, help="Override vocabulary.k.")
     parser.add_argument("--output-dir", default=None, help="Override paths.output_dir.")

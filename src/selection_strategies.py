@@ -151,7 +151,7 @@ class GlobalClassFrequency(VisualWordSelectionStrategy):
     terms. Ranks each class's candidates by this alone.
     """
 
-    name = "global_class_frequency"
+    name = "GCF"
 
     def score_matrix(self, vocabulary_stats: VocabularyStats) -> Dict[str, np.ndarray]:
         return {c: vocabulary_stats.F[c] for c in vocabulary_stats.classes}
@@ -169,7 +169,7 @@ class IntraClassCorverage(VisualWordSelectionStrategy):
     entirely from one image.
     """
 
-    name = "intra_class_corverage"
+    name = "ICC"
 
     def score_matrix(self, vocabulary_stats: VocabularyStats) -> Dict[str, np.ndarray]:
         scores = {}
@@ -199,7 +199,7 @@ class ClassExclusivityDiscriminative(VisualWordSelectionStrategy):
     class's own ranking, not merely rescale it.
     """
 
-    name = "class_exclusivity_discriminatve"
+    name = "CED"
 
     def score_matrix(self, vocabulary_stats: VocabularyStats) -> Dict[str, np.ndarray]:
         icc_scores = IntraClassCorverage().score_matrix(vocabulary_stats)
@@ -212,9 +212,9 @@ class ClassExclusivityDiscriminative(VisualWordSelectionStrategy):
 # Registry / factory
 # --------------------------------------------------------------------------- #
 _STRATEGIES = {
-    "global_class_frequency": GlobalClassFrequency,
-    "intra_class_corverage": IntraClassCorverage,
-    "class_exclusivity_discriminatve": ClassExclusivityDiscriminative,
+    "GCF": GlobalClassFrequency,
+    "ICC": IntraClassCorverage,
+    "CED": ClassExclusivityDiscriminative,
 }
 
 

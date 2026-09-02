@@ -125,3 +125,4 @@ def test_compute_vocabulary_stats_populates_per_class_matrix(tmp_path):
     assert stats.F["dog"].tolist() == [0.0, 5.0, 0.0]
     # per_class_matrix rows must sum to F for internal consistency.
     assert stats.per_class_matrix["cat"].sum(axis=0).tolist() == stats.F["cat"].tolist()
+

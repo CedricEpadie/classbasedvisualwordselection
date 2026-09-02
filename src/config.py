@@ -87,22 +87,30 @@ class FeatureExtractionConfig(StrictModel):
     vit: ViTFeatureConfig = ViTFeatureConfig()  # === ViT (option B) ===
 
 
-class MeanShiftConfig(StrictModel):
-    """Step 2 of the CVWS pipeline ('Réduction de redondance par
-    clustering hiérarchique (Mean Shift)') — only used by the *_cvws
-    approaches (bovw_cvws, cnn_bovw_cvws); bovw_baseline/cnn_bovw skip
-    this entirely and K-means directly on the full descriptor space D.
+class UMAPConfig(StrictModel):
+    """Step 3 of the CVWS pipeline ('Réduction de dimensionnalité') — only
+    used by the *_cvws approaches (bovw_cvws, cnn_bovw_cvws, vit_cvws);
+    bovw_baseline/cnn_bovw skip this entirely and K-means directly on the
+    full descriptor space D.
     """
 
-    # Passed to sklearn.cluster.estimate_bandwidth(..., quantile=...) to
-    # auto-estimate the Mean Shift bandwidth from the descriptor
-    # distribution. No subsampling is applied (estimate_bandwidth and
-    # MeanShift both run on every training descriptor) — see
-    # `vocabulary.reduce_descriptors_mean_shift`.
-    quantile: float = 0.3
-    # sklearn speed optimization (bins points onto a grid before seeding
-    # cluster centers) — does NOT subsample the data itself.
-    bin_seeding: bool = True
+    n_components: int = 10  # d = 10, per the spec
+    n_neighbors: int = 15  # umap-learn default
+    min_dist: float = 0.1  # umap-learn default
+
+
+class HDBSCANConfig(StrictModel):
+    """Step 4 ('Clustering non supervisé'). Hyperparameters are expressed
+    as PERCENTAGES of the training descriptor count / of min_cluster_size,
+    per the spec, so they scale automatically with corpus size:
+        min_cluster_size = min_cluster_size_pct% of n_training_descriptors
+        min_samples      = min_samples_pct% of min_cluster_size
+    Both are clamped to sklearn's minimums (min_cluster_size >= 2,
+    min_samples >= 1) — see `cvws_clustering.reduce_and_cluster`.
+    """
+
+    min_cluster_size_pct: float = 0.01  # 0.01% of the descriptor count
+    min_samples_pct: float = 1.0  # 1% of min_cluster_size
 
 
 class VocabularyConfig(StrictModel):
@@ -111,43 +119,56 @@ class VocabularyConfig(StrictModel):
     minibatch: bool = True
     minibatch_batch_size: int = 1000
     max_iter: int = 100
-    mean_shift: MeanShiftConfig = MeanShiftConfig()
+    umap: UMAPConfig = UMAPConfig()
+    hdbscan: HDBSCANConfig = HDBSCANConfig()
 
 
 class SelectionConfig(StrictModel):
-    """Configures the CVWS candidate-selection step (step 3 of the 5-step
-    vocabulary-construction pipeline used by bovw_cvws/cnn_bovw_cvws — see
-    `pipeline.PipelineRunner._run_cvws_variants`):
+    """Configures the CVWS candidate-selection step (steps 7-8 of the
+    11-step CVWS pipeline used by bovw_cvws/cnn_bovw_cvws/vit_cvws — see
+    `pipeline.PipelineRunner._run_cvws_variants` and
+    `cvws_clustering.py`'s module docstring):
 
-      1. Local descriptors extracted per image -> union D (unchanged)
-      2. Mean Shift over D -> reduced "candidate" descriptors (unchanged
-         regardless of `strategies`/`n_candidates_per_class` below)
-      3. THIS STEP: for each class, candidates are scored by one of the
-         three strategies (GCF/ICC/CED, "Stratégie de sélection des mots
-         visuels", Epadie 2026) and assigned via argmax; the
-         `n_candidates_per_class` highest-scoring candidates *within* each
-         class's assigned set are kept (union across classes -> feeds
-         step 4). One full run (steps 3-5) happens per entry in
-         `strategies`, each producing its own final vocabulary/results row.
-      4. K-means (K = vocabulary.k) on the union from step 3 -> final
-         vocabulary
-      5. Every image re-encoded (BoVW histogram) on that final vocabulary
+      1. Preprocessing (unchanged)
+      2. Local descriptor extraction, provenance (image <-> descriptor) kept
+      3. UMAP -> d=umap.n_components
+      4. HDBSCAN (cosine) on the UMAP embedding -> cluster ids
+      5. Drop noise (HDBSCAN label -1)
+      6. Symbolic re-encoding: each image -> per-cluster occurrence counts
+      7. THIS STEP: each class independently ranks cluster ids by one of
+         the three strategies (GCF/ICC/CED, "Stratégie de sélection des
+         mots visuels", Epadie 2026) over their step-6 occurrence counts,
+         and keeps its own `n_candidates_per_class` highest-scoring
+         cluster ids -- no competition against other classes, so a
+         cluster id can be kept by several classes at once.
+      8. THIS STEP: a cluster selected by `selection_count` distinct
+         classes contributes its `selection_count` highest-HDBSCAN-
+         probability member descriptors (nearest its medoid) to the final
+         candidate pool.
+      9. Candidates mapped back to the original (pre-UMAP) descriptor
+         space -> K-means (K = vocabulary.k, cosine) -> final vocabulary
+      10. Every image re-encoded (BoVW histogram) on that final vocabulary
+      11. Classification (unchanged)
+
+    One full run of steps 7-10 happens per entry in `strategies`, each
+    producing its own final vocabulary/results row (steps 1-6 are shared
+    across strategies).
     """
 
     strategies: List[
-        Literal["global_class_frequency", "intra_class_corverage", "class_exclusivity_discriminatve"]
+        Literal["GCF", "ICC", "CED"]
     ] = Field(
         default_factory=lambda: [
-            "global_class_frequency",
-            "intra_class_corverage",
-            "class_exclusivity_discriminatve",
+            "GCF",
+            "ICC",
+            "CED",
         ]
     )
-    # n in "les n meilleurs candidats de chaque classe" (step 3). Explicit
-    # and required — unlike the old, now-removed `top_n = vocabulary_size
-    # // n_classes` auto-formula: this now operates on the Mean-Shift
-    # candidate space, whose size isn't known from vocabulary.k alone, so
-    # there's no equivalent auto-derivation and it must be set explicitly.
+    # n in "les n meilleurs [identifiants de cluster] de chaque classe"
+    # (step 7). Explicit and required, exactly as before -- except it now
+    # caps the number of CLUSTER IDS kept per class (typically a much
+    # smaller space than the old Mean-Shift candidate count), not raw
+    # descriptor candidates directly.
     n_candidates_per_class: int = 50
 
 
@@ -191,7 +212,7 @@ class ApproachesConfig(StrictModel):
     # =======================================================================
     # === ViT (cvws) =========================================================
     # "vit_cvws" feeds ViT patch-token local descriptors into the same
-    # 5-step CVWS candidate pipeline as bovw_cvws/cnn_bovw_cvws (see
+    # 11-step CVWS pipeline as bovw_cvws/cnn_bovw_cvws (see
     # pipeline.run_vit_cvws / _run_cvws_variants). Also opt-in, same
     # rationale as vit_end_to_end above.
     # =======================================================================

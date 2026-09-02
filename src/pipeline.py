@@ -7,24 +7,32 @@ idempotent execution. Also supports running on every dataset found under a
 Approaches:
     bovw_baseline        preprocessing -> SIFT -> KMeans (direct on D) -> histograms -> classifiers
     cnn_bovw             preprocessing -> CNN local features -> KMeans (direct on D) -> histograms -> classifiers
-    bovw_cvws       preprocessing -> SIFT -> UMAP -> HDBSCAN -> selection -> KMeans -> classifiers
-    cnn_bovw_cvws   preprocessing -> CNN local features -> UMAP -> HDBSCAN -> selection -> KMeans -> classifiers
-    vit_cvws        preprocessing -> ViT patch-token local features -> UMAP -> HDBSCAN -> selection -> KMeans  -> classifiers
+    bovw_cvws       preprocessing -> SIFT -> 11-step CVWS pipeline -> classifiers
+    cnn_bovw_cvws   preprocessing -> CNN local features -> 11-step CVWS pipeline -> classifiers
+    vit_cvws        preprocessing -> ViT patch-token local features -> 11-step CVWS pipeline -> classifiers
                     === ViT (cvws), see run_vit_cvws ===
     cnn_end_to_end        preprocessing -> CNN global pooled vector -> classifiers (no BoVW step)
     vit_end_to_end        preprocessing -> ViT [CLS] embedding -> classifiers (no BoVW step)
                          === ViT (option B), see run_vit_end_to_end ===
 
-The *_cvws approaches' 5-step CVWS ("Class-based Visual Word Selection")
-candidate pipeline (see `PipelineRunner._run_cvws_variants`,
-`vocabulary.py`'s module docstring, and `selection_strategies.py`) differs
-structurally from bovw_baseline/cnn_bovw's direct K-means: it Mean-Shift
-reduces D into redundancy-free candidates, scores and selects the best
-`n_candidates_per_class` candidates per class (one full run per strategy
-in `selection.strategies`), and ONLY THEN runs the final K-means on the
-selected union -- selection shapes which descriptors feed vocabulary
-construction, rather than post-hoc masking a vocabulary already built on
-all of D. See "Stratégie de sélection des mots visuels" (Epadie, Aug 2026).
+The *_cvws approaches' 11-step CVWS ("Class-based Visual Word Selection")
+pipeline (see `PipelineRunner._run_cvws_variants`, `cvws_clustering.py`'s
+module docstring, and `selection_strategies.py`) differs structurally from
+bovw_baseline/cnn_bovw's direct K-means: local descriptors (with
+image/descriptor provenance kept) are UMAP-reduced (d=10) then HDBSCAN-
+clustered (cosine); noise (label -1) is dropped; each training image is
+symbolically re-encoded as per-cluster occurrence counts; for each class,
+clusters are scored (GCF/ICC/CED) and the top
+`selection.n_candidates_per_class` kept; a cluster selected by
+`selection_count` distinct classes contributes its `selection_count`
+highest-probability member descriptors (mapped back to their ORIGINAL,
+pre-UMAP space) to a pooled candidate set; K-means (cosine, K=vocabulary.k)
+on that pool produces the final vocabulary. Selection shapes which
+descriptors feed vocabulary construction, rather than post-hoc masking a
+vocabulary already built on all of D. One full run of the
+selection-through-final-vocabulary steps happens per entry in
+`selection.strategies`. See "Pipeline de construction d'un vocabulaire
+visuel par sélection de mots visuels basée sur la classe" (Epadie, Aug 2026).
 `vit_cvws` feeds this same pipeline with ViT patch-token descriptors
 (`ViTExtractor`'s "local" mode) instead of SIFT/CNN local features.
 """
@@ -41,20 +49,14 @@ from sklearn.model_selection import train_test_split
 
 from src.classifiers import build_classifier
 from src.config import PipelineConfig, ensure_run_id
+from src.cvws_clustering import compute_cluster_stats, reduce_and_cluster, select_clusters_and_build_candidates
 from src.feature_extraction import CnnExtractor, ViTExtractor, extract_features_dataset  # === ViT (option B): ViTExtractor added ===
 from src.pipeline_state import PipelineState
 from src.preprocessing import preprocess_dataset
 from src.selection_strategies import build_strategy
-from src.utils.io_utils import atomic_write_json, atomic_write_pickle, ensure_dir, read_pickle
+from src.utils.io_utils import atomic_write_json, atomic_write_npy, atomic_write_pickle, ensure_dir, read_pickle
 from src.utils.logging_utils import log_step, setup_logger
-from src.vocabulary import (
-    Vocabulary,
-    build_vocabulary,
-    build_vocabulary_from_descriptors,
-    compute_vocabulary_stats,
-    encode_histograms,
-    reduce_descriptors_mean_shift,
-)
+from src.vocabulary import Vocabulary, build_vocabulary, build_vocabulary_from_descriptors, encode_histograms
 
 # Every approach the framework knows how to run, in a stable display order.
 # Exposed here (rather than only inside ApproachesConfig) so the CLI's
@@ -287,7 +289,8 @@ class PipelineRunner:
 
     # === ViT (cvws) =========================================================
     # Mirrors `_extract_cnn_local`, but for ViT patch-token descriptors
-    # the pooled [CLS] embedding above).
+    # (used by `run_vit_cvws`'s 11-step CVWS pipeline instead of the
+    # pooled [CLS] embedding above).
     def _extract_vit_local(self, preprocessed: Dict[str, str]) -> Dict[str, str]:
         backbone = self.cfg.feature_extraction.vit.backbone
         h = self.cfg.section_hash("feature_extraction")
@@ -477,9 +480,9 @@ class PipelineRunner:
         )
 
     def run_bovw_cvws(self) -> List[dict]:
-        """CVWS (for SIFT): preprocessing -> SIFT -> 5-step
-        candidate pipeline (HDBSCAN + per-class selection + final
-        K-means) -> classifiers. See `_run_cvws_variants`."""
+        """CVWS ('Ma Méthode' for SIFT): preprocessing -> SIFT -> 11-step
+        CVWS pipeline (UMAP + HDBSCAN + per-class selection + final
+        cosine K-means) -> classifiers. See `_run_cvws_variants`."""
         preprocessed, labels = self._preprocess()
         ids = list(preprocessed.keys())
         train_ids, test_ids = self._train_test_split(ids, labels)
@@ -497,7 +500,7 @@ class PipelineRunner:
         X_test = np.stack([np.load(global_paths[i]) for i in test_ids])
         y_test = np.array([labels[i] for i in test_ids])
         return self._train_and_evaluate(
-            "cnn_end_to_end", "global", X_train, y_train, X_test, y_test, test_ids, nb_vw="r.a.s"
+            "cnn_end_to_end", "global", X_train, y_train, X_test, y_test, test_ids, nb_vw="RAS"
         )
 
     def run_cnn_bovw(self) -> List[dict]:
@@ -513,8 +516,8 @@ class PipelineRunner:
         )
 
     def run_cnn_bovw_cvws(self) -> List[dict]:
-        """CVWS (for CNN): preprocessing -> CNN local features
-        -> 5-step candidate pipeline -> classifiers. See `_run_cvws_variants`."""
+        """CVWS ('Ma Methode' for CNN): preprocessing -> CNN local features
+        -> 11-step CVWS pipeline -> classifiers. See `_run_cvws_variants`."""
         preprocessed, labels = self._preprocess()
         ids = list(preprocessed.keys())
         train_ids, test_ids = self._train_test_split(ids, labels)
@@ -523,9 +526,10 @@ class PipelineRunner:
 
     # === ViT (cvws) =========================================================
     def run_vit_cvws(self) -> List[dict]:
-        """CVWS (for ViT): preprocessing -> ViT patch-token
-        local features -> 5-step candidate pipeline (HDBSCAN + per-class
-        selection + final K-means) -> classifiers. See `_run_cvws_variants`."""
+        """CVWS ('Ma Methode' for ViT): preprocessing -> ViT patch-token
+        local features -> 11-step CVWS pipeline (UMAP + HDBSCAN +
+        per-class selection + final cosine K-means) -> classifiers.
+        See `_run_cvws_variants`."""
         preprocessed, labels = self._preprocess()
         ids = list(preprocessed.keys())
         train_ids, test_ids = self._train_test_split(ids, labels)
@@ -557,7 +561,7 @@ class PipelineRunner:
             X_test,
             y_test,
             test_ids,
-            nb_vw="r.a.s",
+            nb_vw="RAS",
             # No vocabulary section involved for this approach -- see the
             # `include_vocabulary` note on `_training_hash` above.
             training_hash=self._training_hash(include_vocabulary=False),
@@ -575,15 +579,17 @@ class PipelineRunner:
     # === fin ViT (option B) ================================================
 
     # ------------------------------------------------------------------ #
-    # CVWS candidate pipeline (bovw_cvws / cnn_bovw_cvws only) — 5 steps:
-    #   1. local descriptors (already extracted by the caller)  -> D
-    #   2. Mean Shift over D                                      -> candidates
-    #   3. per-class scoring (GCF/ICC/CED) + top-n selection      -> selected candidates
-    #   4. final K-means (K = vocabulary.k) on selected candidates -> final vocabulary V
-    #   5. encode every image (train+test) on V                   -> histograms -> classifiers
-    # Steps 2-3 run once per approach/tag (shared across strategies); steps
-    # 4-5 (and therefore the final vocabulary itself) run once PER
-    # strategy, since different strategies select different candidates.
+    # CVWS pipeline (bovw_cvws / cnn_bovw_cvws / vit_cvws only) — steps 3-10
+    # (steps 1-2, extraction+provenance, already done by the caller):
+    #   3-5. UMAP -> HDBSCAN (cosine) -> drop noise           -> ClusteringResult
+    #   6.   symbolic re-encoding + per-class cluster stats    -> VocabularyStats
+    #   7-8. per-class Top-N cluster selection + probability-
+    #        weighted candidate reconstruction (original space) -> candidates
+    #   9.   final K-means (cosine, K = vocabulary.k)          -> final vocabulary V
+    #   10.  encode every image (train+test) on V              -> histograms -> classifiers
+    # Steps 3-6 run once per approach/tag (shared across strategies); steps
+    # 7-10 (and therefore the final vocabulary itself) run once PER
+    # strategy, since different strategies select different clusters.
     # ------------------------------------------------------------------ #
     def _run_cvws_variants(
         self,
@@ -594,55 +600,36 @@ class PipelineRunner:
         labels: Dict[str, str],
         tag: str,
     ) -> List[dict]:
-        # Both Mean Shift's own params and the descriptors feeding it
+        # Both UMAP/HDBSCAN's own params and the descriptors feeding them
         # (feature_extraction) must invalidate this cache.
-        h_candidates = self.cfg.section_hash("vocabulary", "feature_extraction")
+        h_clustering = self.cfg.section_hash("vocabulary", "feature_extraction")
 
-        # --- Step 2: Mean Shift redundancy reduction (train descriptors only) ---
-        candidates_dir = ensure_dir(Path(self.cfg.paths.output_dir) / "vocabulary")
-        candidates_path = candidates_dir / f"{self.cfg.dataset_name}_{tag}_meanshift_candidates.pkl"
+        # --- Steps 3-5: UMAP -> HDBSCAN -> drop noise (train descriptors only) ---
+        clustering_dir = ensure_dir(Path(self.cfg.paths.output_dir) / "vocabulary")
+        clustering_path = clustering_dir / f"{self.cfg.dataset_name}_{tag}_umap_hdbscan.pkl"
         train_descriptors = {i: descriptor_paths[i] for i in train_ids}
-        candidate_vocab = self._step(
-            f"reduce_mean_shift_{tag}",
-            h_candidates,
-            reduce_descriptors_mean_shift,
+        clustering_result = self._step(
+            f"reduce_and_cluster_{tag}",
+            h_clustering,
+            reduce_and_cluster,
             train_descriptors,
             self.cfg,
             self.logger,
-            candidates_path,
+            clustering_path,
         )
-        if candidate_vocab is None:
-            candidate_vocab = read_pickle(candidates_path)
+        if clustering_result is None:
+            clustering_result = read_pickle(clustering_path)
 
-        # --- Step 3a: encode TRAIN images on the candidate set (raw counts) ---
-        candidate_hist_dir = (
-            Path(self.cfg.paths.output_dir)
-            / "histograms"
-            / f"{self.cfg.dataset_name}_{tag}_meanshift_candidates"
-        )
-        candidate_histograms = self._step(
-            f"encode_candidate_histograms_{tag}",
-            h_candidates,
-            encode_histograms,
-            train_descriptors,
-            candidate_vocab,
-            self.cfg,
-            self.logger,
-            candidate_hist_dir,
-        )
-        if candidate_histograms is None:
-            candidate_histograms = {img_id: str(candidate_hist_dir / f"{img_id}.npy") for img_id in train_descriptors}
-
-        # --- Step 3b: per-class candidate stats (F, DF, per-image matrix) ---
+        # --- Step 6: symbolic re-encoding + per-class cluster stats (train only) ---
         stats_dir = ensure_dir(Path(self.cfg.paths.output_dir) / "vocabulary_stats")
-        stats_path = stats_dir / f"{self.cfg.dataset_name}_{tag}_meanshift_candidates.pkl"
+        stats_path = stats_dir / f"{self.cfg.dataset_name}_{tag}_umap_hdbscan.pkl"
 
         def _compute_and_persist_stats():
-            stats = compute_vocabulary_stats(candidate_histograms, labels, candidate_vocab.k, self.logger)
+            stats = compute_cluster_stats(clustering_result, labels, self.logger)
             atomic_write_pickle(stats_path, stats)
             return stats
 
-        stats = self._step(f"compute_candidate_stats_{tag}", h_candidates, _compute_and_persist_stats)
+        stats = self._step(f"compute_cluster_stats_{tag}", h_clustering, _compute_and_persist_stats)
         if stats is None:
             stats = read_pickle(stats_path)
 
@@ -651,42 +638,36 @@ class PipelineRunner:
             strategy = build_strategy(strategy_name)
             n = self.cfg.selection.n_candidates_per_class
             # Selection depends on the selection params AND everything the
-            # candidate set itself depends on.
+            # cluster set itself depends on.
             h_selection = self.cfg.section_hash("selection", "vocabulary", "feature_extraction")
 
-            # --- Step 3c: score + select top-n candidates per class, union ---
+            # --- Steps 7-8: per-class cluster selection + weighted candidate reconstruction ---
             selection_dir = ensure_dir(Path(self.cfg.paths.output_dir) / "selection")
-            selection_path = (
-                selection_dir
-                / f"{self.cfg.dataset_name}_{tag}_strategy-{strategy_name}_ncand{n}.json"
+            selection_path = selection_dir / f"{self.cfg.dataset_name}_{tag}_strategy-{strategy_name}_ncand{n}.json"
+            candidates_path = (
+                selection_dir / f"{self.cfg.dataset_name}_{tag}_strategy-{strategy_name}_ncand{n}_candidates.npy"
             )
 
-            def _compute_and_persist_selection(strategy=strategy, stats=stats, selection_path=selection_path, n=n):
-                # Persist the full per-class assignment (candidate ->
-                # owning class, capped to n by score) for
-                # interpretability/audit, alongside the union actually fed
-                # to the final K-means.
-                per_class = {c: sorted(strategy.select_top_n(stats, c, n)) for c in stats.classes}
-                union = sorted(set().union(*per_class.values())) if per_class else []
-                atomic_write_json(
-                    selection_path,
-                    {
-                        "strategy": strategy.name,
-                        "n_candidates_per_class": n,
-                        "n_total_candidates": candidate_vocab.k,
-                        "per_class_assignment": per_class,
-                        "selected_indices": union,
-                    },
+            def _compute_and_persist_candidates(
+                strategy=strategy, n=n, selection_path=selection_path, candidates_path=candidates_path
+            ):
+                # audit_info (per-class selected cluster ids + per-cluster
+                # selection counts) is persisted for interpretability, next
+                # to the actual candidate descriptor matrix fed to step 9.
+                candidate_descriptors, audit_info = select_clusters_and_build_candidates(
+                    clustering_result, stats, strategy, n, descriptor_paths, self.logger
                 )
-                return set(union)
+                atomic_write_json(selection_path, audit_info)
+                atomic_write_npy(candidates_path, candidate_descriptors)
+                return candidate_descriptors
 
-            selected = self._step(f"select_candidates_{approach}_{strategy_name}", h_selection, _compute_and_persist_selection)
-            if selected is None:
-                selected = set(__import__("json").loads(selection_path.read_text())["selected_indices"])
+            candidate_descriptors = self._step(
+                f"select_and_build_candidates_{approach}_{strategy_name}", h_selection, _compute_and_persist_candidates
+            )
+            if candidate_descriptors is None:
+                candidate_descriptors = np.load(candidates_path)
 
-            selected_descriptors = candidate_vocab.cluster_centers[sorted(selected)]
-
-            # --- Step 4: final K-means (K = vocabulary.k) on the selected candidates ---
+            # --- Step 9: final K-means (cosine, K = vocabulary.k) on the candidates ---
             final_vocab_dir = ensure_dir(Path(self.cfg.paths.output_dir) / "vocabulary")
             final_vocab_path = (
                 final_vocab_dir
@@ -696,15 +677,17 @@ class PipelineRunner:
                 f"build_final_vocab_{approach}_{strategy_name}",
                 h_selection,
                 build_vocabulary_from_descriptors,
-                selected_descriptors,
+                candidate_descriptors,
                 self.cfg,
                 self.logger,
                 final_vocab_path,
+                None,  # k=None -> defaults to cfg.vocabulary.k
+                "cosine",  # metric -- see build_vocabulary_from_descriptors's docstring
             )
             if final_vocab is None:
                 final_vocab = read_pickle(final_vocab_path)
 
-            # --- Step 5: encode EVERY image (train+test) on the final vocabulary ---
+            # --- Step 10: encode EVERY image (train+test) on the final vocabulary ---
             final_hist_dir = (
                 Path(self.cfg.paths.output_dir)
                 / "histograms"

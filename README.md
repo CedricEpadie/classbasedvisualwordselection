@@ -124,7 +124,7 @@ python run_comparison.py --config config.yaml --dataset-dir data/dtd --classifie
 python run_comparison.py --config config.yaml --approaches bovw_baseline cnn_bovw_cvws
 
 # Different final vocabulary size, different selection strategies
-python run_comparison.py --config config.yaml --vocabulary-k 128 --selection-strategies global_class_frequency
+python run_comparison.py --config config.yaml --vocabulary-k 128 --selection-strategies GCF
 
 # One specific approach only (shortcut for --approaches with a single value)
 python run_comparison.py --config config.yaml --approach bovw_baseline
@@ -314,9 +314,9 @@ n)` ranks `score_matrix(stats)[class_label]` on its own and keeps the top
 
 | Method | Config name | Score `score(v, C)` |
 |---|---|---|
-| 1 — Global Class Frequency (GCF) | `global_class_frequency` | `S_GCF(v,C) = Σ_{i∈C} f(v,i)` |
-| 2 — Intra-Class Coverage (ICC) | `intra_class_corverage` | `S_ICC(v,C) = S_GCF(v,C) · H_intra(v,C)` |
-| 3 — Class Exclusivity Discriminative (CED) | `class_exclusivity_discriminatve` | `S_CED(v,C) = S_ICC(v,C) · (1 − H_inter(v))` |
+| 1 — Global Class Frequency (GCF) | `GCF` | `S_GCF(v,C) = Σ_{i∈C} f(v,i)` |
+| 2 — Intra-Class Coverage (ICC) | `ICC` | `S_ICC(v,C) = S_GCF(v,C) · H_intra(v,C)` |
+| 3 — Class Exclusivity Discriminative (CED) | `CED` | `S_CED(v,C) = S_ICC(v,C) · (1 − H_inter(v))` |
 
 where `f(v,i)` is the occurrence count of candidate `v` in image `i`,
 `H_intra(v,C)` is the normalized Shannon entropy of `v`'s distribution
