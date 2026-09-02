@@ -52,35 +52,44 @@ vocabulary:
   k: 256                        # visual vocabulary size (number of clusters);
                                  # for bovw_baseline/cnn_bovw, K-means runs
                                  # directly on D with this K. For bovw_cvws/
-                                 # cnn_bovw_cvws, this is instead the FINAL
-                                 # K-means size in step 4 of the CVWS pipeline
-                                 # (run on the selected candidates, not on D).
+                                 # cnn_bovw_cvws/vit_cvws, this is instead the
+                                 # FINAL K-means size in step 9 of the CVWS
+                                 # pipeline (run on the reconstructed
+                                 # candidates, not on D).
   seed: 42
   minibatch: true                # MiniBatchKMeans (scalable) vs. exact KMeans
   minibatch_batch_size: 1000
   max_iter: 100
-  # Step 2 of the CVWS pipeline ("Réduction de redondance par clustering
-  # hiérarchique (Mean Shift)") -- only used by bovw_cvws/cnn_bovw_cvws;
-  # bovw_baseline/cnn_bovw ignore this entirely.
-  mean_shift:
-    quantile: 0.3                # passed to sklearn's estimate_bandwidth(); no subsampling
-    bin_seeding: true             # sklearn speed optimization, not subsampling
+  # Step 3 of the CVWS pipeline ("Réduction de dimensionnalité") -- only
+  # used by bovw_cvws/cnn_bovw_cvws/vit_cvws; bovw_baseline/cnn_bovw
+  # ignore this entirely.
+  umap:
+    n_components: 10              # d = 10, per the spec
+    n_neighbors: 15
+    min_dist: 0.1
+  # Step 4 ("Clustering non supervisé") -- percentages of the training
+  # descriptor count / of min_cluster_size, so they scale with corpus size.
+  hdbscan:
+    min_cluster_size_pct: 0.01    # 0.01% of the training descriptor count
+    min_samples_pct: 1.0          # 1% of min_cluster_size
 
 selection:
-  # The 3 candidate-scoring strategies from "Stratégie de sélection des
-  # mots visuels" (Epadie, Aug. 2026), applied in step 3 of the CVWS
-  # pipeline (see README section 7). Each assigns every Mean-Shift
-  # candidate v to the class c*(v) = argmax_c score(v,c), then keeps only
-  # the n_candidates_per_class highest-scoring candidates within each
-  # class's assigned set. One full run of steps 3-5 happens per strategy
-  # listed here.
+  # The 3 cluster-scoring strategies from "Stratégie de sélection des mots
+  # visuels" (Epadie, Aug. 2026), applied in step 7 of the CVWS pipeline
+  # (see README section 7). Each class independently ranks the HDBSCAN
+  # cluster ids by its own score(v,c) over its step-6 occurrence counts,
+  # then keeps its own n_candidates_per_class highest-scoring cluster ids
+  # -- no competition against other classes, so a cluster id can be kept
+  # by several classes at once. One full run of steps 7-10 happens per
+  # strategy listed here.
   strategies:
     - global_class_frequency              # Méthode 1 (GCF): score = S_GCF(v,c)
     - intra_class_corverage    # Méthode 2 (ICC): score = S_GCF(v,c) * H_intra(v,c)
     - class_exclusivity_discriminatve             # Méthode 3 (CED): score = S_ICC(v,c) * (1 - H_inter(v))
-  # n in "les n meilleurs candidats de chaque classe" (step 3). Explicit
-  # and required -- operates on the Mean-Shift candidate space, whose size
-  # is data-dependent and not derivable from vocabulary.k alone.
+  # n in "les n meilleurs [identifiants de cluster] de chaque classe"
+  # (step 7). Explicit and required -- operates on the HDBSCAN cluster-id
+  # space, whose size is data-dependent and not derivable from
+  # vocabulary.k alone.
   n_candidates_per_class: 50
 
 classifiers:

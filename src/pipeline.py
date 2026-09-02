@@ -7,9 +7,9 @@ idempotent execution. Also supports running on every dataset found under a
 Approaches:
     bovw_baseline        preprocessing -> SIFT -> KMeans (direct on D) -> histograms -> classifiers
     cnn_bovw             preprocessing -> CNN local features -> KMeans (direct on D) -> histograms -> classifiers
-    bovw_cvws       preprocessing -> SIFT -> 5-step CVWS candidate pipeline -> classifiers
-    cnn_bovw_cvws   preprocessing -> CNN local features -> 5-step CVWS candidate pipeline -> classifiers
-    vit_cvws        preprocessing -> ViT patch-token local features -> 5-step CVWS candidate pipeline -> classifiers
+    bovw_cvws       preprocessing -> SIFT -> UMAP -> HDBSCAN -> selection -> KMeans -> classifiers
+    cnn_bovw_cvws   preprocessing -> CNN local features -> UMAP -> HDBSCAN -> selection -> KMeans -> classifiers
+    vit_cvws        preprocessing -> ViT patch-token local features -> UMAP -> HDBSCAN -> selection -> KMeans  -> classifiers
                     === ViT (cvws), see run_vit_cvws ===
     cnn_end_to_end        preprocessing -> CNN global pooled vector -> classifiers (no BoVW step)
     vit_end_to_end        preprocessing -> ViT [CLS] embedding -> classifiers (no BoVW step)
@@ -287,7 +287,6 @@ class PipelineRunner:
 
     # === ViT (cvws) =========================================================
     # Mirrors `_extract_cnn_local`, but for ViT patch-token descriptors
-    # (used by `run_vit_cvws`'s 5-step CVWS candidate pipeline instead of
     # the pooled [CLS] embedding above).
     def _extract_vit_local(self, preprocessed: Dict[str, str]) -> Dict[str, str]:
         backbone = self.cfg.feature_extraction.vit.backbone
@@ -478,8 +477,8 @@ class PipelineRunner:
         )
 
     def run_bovw_cvws(self) -> List[dict]:
-        """CVWS ('Ma Méthode' for SIFT): preprocessing -> SIFT -> 5-step
-        candidate pipeline (Mean Shift + per-class selection + final
+        """CVWS (for SIFT): preprocessing -> SIFT -> 5-step
+        candidate pipeline (HDBSCAN + per-class selection + final
         K-means) -> classifiers. See `_run_cvws_variants`."""
         preprocessed, labels = self._preprocess()
         ids = list(preprocessed.keys())
@@ -514,7 +513,7 @@ class PipelineRunner:
         )
 
     def run_cnn_bovw_cvws(self) -> List[dict]:
-        """CVWS ('Ma Methode' for CNN): preprocessing -> CNN local features
+        """CVWS (for CNN): preprocessing -> CNN local features
         -> 5-step candidate pipeline -> classifiers. See `_run_cvws_variants`."""
         preprocessed, labels = self._preprocess()
         ids = list(preprocessed.keys())
@@ -524,8 +523,8 @@ class PipelineRunner:
 
     # === ViT (cvws) =========================================================
     def run_vit_cvws(self) -> List[dict]:
-        """CVWS ('Ma Methode' for ViT): preprocessing -> ViT patch-token
-        local features -> 5-step candidate pipeline (Mean Shift + per-class
+        """CVWS (for ViT): preprocessing -> ViT patch-token
+        local features -> 5-step candidate pipeline (HDBSCAN + per-class
         selection + final K-means) -> classifiers. See `_run_cvws_variants`."""
         preprocessed, labels = self._preprocess()
         ids = list(preprocessed.keys())

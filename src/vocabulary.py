@@ -7,51 +7,76 @@ per-image, per-class frequency statistics `f(w, I)`, `F(w, c)`, `DF(w, c)`
 needed by the selection strategies (section 3 of the spec) without those
 strategies having to touch raw descriptors again.
 
-Also provides the two extra building blocks used ONLY by the CVWS
-candidate pipeline (bovw_cvws / cnn_bovw_cvws — see
-`pipeline.PipelineRunner._run_cvws_variants`), steps 2 and 4 of the 5-step
-vocabulary construction:
-    reduce_descriptors_mean_shift   step 2: Mean Shift redundancy reduction
-    build_vocabulary_from_descriptors   step 4: final K-means on an
-                                         in-memory descriptor matrix (the
-                                         selected candidates), as opposed
-                                         to `build_vocabulary`, which loads
-                                         descriptors from per-image files.
-bovw_baseline / cnn_bovw are untouched: they still call `build_vocabulary`
-directly on the full descriptor set D, with no Mean Shift step.
+Also provides `build_vocabulary_from_descriptors`, used by the CVWS
+candidate pipeline's step 9 (final K-means quantization on the selected
+candidates -- see `cvws_clustering.py`'s module docstring and
+`pipeline.PipelineRunner._run_cvws_variants`) with `metric="cosine"`.
+bovw_baseline/cnn_bovw are untouched: they still call `build_vocabulary`
+directly on the full descriptor set D with the default `metric="euclidean"`.
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 import numpy as np
-from sklearn.cluster import KMeans, MeanShift, MiniBatchKMeans, estimate_bandwidth
+from sklearn.cluster import KMeans, MiniBatchKMeans
 from tqdm import tqdm
 
 from src.config import PipelineConfig
 from src.utils.io_utils import atomic_write_npy, atomic_write_pickle, ensure_dir, path_exists_and_valid, read_pickle
 
 
+def l2_normalize(x: np.ndarray) -> np.ndarray:
+    """Row-wise L2 normalization (rows of an all-zero vector are left
+    as-is, to avoid NaNs from a division by zero).
+
+    Used to implement cosine distance/similarity on top of algorithms
+    (K-means here; UMAP/HDBSCAN in `cvws_clustering.py`) that don't
+    support it natively in scikit-learn: for unit vectors,
+    ||a-b||^2 = 2 - 2*cos(a,b), so Euclidean nearest-neighbor search on
+    L2-normalized vectors ranks identically to cosine distance, at a
+    fraction of the cost of a native cosine implementation.
+    """
+    norms = np.linalg.norm(x, axis=1, keepdims=True)
+    norms = np.where(norms > 0, norms, 1.0)
+    return x / norms
+
+
 @dataclass
 class Vocabulary:
-    """A fitted K-means visual vocabulary."""
+    """A fitted K-means visual vocabulary.
+
+    `metric`: "euclidean" (default -- bovw_baseline/cnn_bovw's direct
+    K-means) or "cosine" (the CVWS pipeline's final vocabulary, step 9 of
+    `cvws_clustering.py`'s module docstring). Cosine is implemented by
+    L2-normalizing both `cluster_centers` and any query descriptors before
+    falling back to the same Euclidean nearest-neighbor search below (see
+    `l2_normalize`) -- mathematically equivalent ranking to true cosine
+    distance, much cheaper to compute.
+    """
 
     k: int
     cluster_centers: np.ndarray  # (K, D)
     seed: int
+    metric: Literal["euclidean", "cosine"] = "euclidean"
 
     def assign(self, descriptors: np.ndarray) -> np.ndarray:
         """Vector-quantize descriptors: return, for each descriptor, the
         index of its nearest visual word. `descriptors`: (N, D)."""
         if descriptors.shape[0] == 0:
             return np.zeros((0,), dtype=np.int64)
+        centers = self.cluster_centers
+        query = descriptors
+        if self.metric == "cosine":
+            centers = l2_normalize(centers)
+            query = l2_normalize(query)
         # Brute-force nearest-center assignment (fine for K in the
         # hundreds/low-thousands range typical of BoVW vocabularies).
         dists = np.linalg.norm(
-            descriptors[:, None, :] - self.cluster_centers[None, :, :], axis=2
+            query[:, None, :] - centers[None, :, :], axis=2
         )
         return np.argmin(dists, axis=1)
 
@@ -69,9 +94,10 @@ class Vocabulary:
 
 def _load_all_descriptors(descriptor_paths: Dict[str, str], desc: str) -> np.ndarray:
     """Load and concatenate every non-empty descriptor file into one (N, D)
-    matrix. Shared by `build_vocabulary` and `reduce_descriptors_mean_shift`
-    (both need "every training descriptor", just feeding different
-    algorithms downstream)."""
+    matrix. Used by `build_vocabulary` (bovw_baseline/cnn_bovw's direct
+    K-means on the full descriptor set D). The CVWS pipeline uses its own
+    provenance-tracking variant instead — see
+    `cvws_clustering._load_descriptors_with_provenance`."""
     all_descriptors: List[np.ndarray] = []
     for path in tqdm(descriptor_paths.values(), desc=desc):
         d = np.load(path)
@@ -110,10 +136,10 @@ def build_vocabulary(
     """Fit K-means over all training descriptors and persist the vocabulary
     (idempotent: skipped if `out_path` already holds a valid vocabulary).
 
-    Used as-is (no Mean Shift, no candidate selection) by bovw_baseline /
+    Used as-is (no UMAP/HDBSCAN, no candidate selection) by bovw_baseline /
     cnn_bovw: K-means runs directly on the full descriptor set D. The
-    *_cvws approaches instead go through `reduce_descriptors_mean_shift`
-    (step 2) and `build_vocabulary_from_descriptors` (step 4) — see the
+    *_cvws approaches instead go through `cvws_clustering.reduce_and_cluster`
+    (steps 3-5) and `build_vocabulary_from_descriptors` (step 9) — see the
     module docstring.
     """
     if path_exists_and_valid(out_path):
@@ -132,75 +158,34 @@ def build_vocabulary(
 
 
 # --------------------------------------------------------------------------- #
-# CVWS candidate pipeline: steps 2 and 4 (bovw_cvws / cnn_bovw_cvws only)
+# CVWS candidate pipeline: step 9 (bovw_cvws / cnn_bovw_cvws / vit_cvws only)
 # --------------------------------------------------------------------------- #
-def reduce_descriptors_mean_shift(
-    train_descriptor_paths: Dict[str, str],
-    cfg: PipelineConfig,
-    logger: logging.Logger,
-    out_path: Path,
-) -> "Vocabulary":
-    """Step 2 of the CVWS pipeline: 'Réduction de redondance par
-    clustering hiérarchique (Mean Shift)'.
-
-    Runs Mean Shift over EVERY training descriptor (no subsampling, by
-    design) with bandwidth auto-estimated via sklearn's
-    `estimate_bandwidth(..., quantile=cfg.vocabulary.mean_shift.quantile)`.
-    The resulting cluster centers are the reduced, representative
-    "candidate" descriptors that step 3 (per-class discriminative scoring,
-    see `selection_strategies.py`) operates on.
-
-    Returned as a `Vocabulary` purely so the existing `.assign()` /
-    `.histogram()` / `encode_histograms` machinery can be reused unchanged
-    to compute per-image candidate-occurrence counts in step 3 — its `k`
-    is however many clusters Mean Shift converges to, which has nothing to
-    do with `cfg.vocabulary.k` (the FINAL vocabulary size, produced later
-    by `build_vocabulary_from_descriptors` in step 4).
-    """
-    if path_exists_and_valid(out_path):
-        logger.info("Mean Shift candidates cache hit: %s", out_path)
-        return read_pickle(out_path)
-
-    logger.info("Loading training descriptors for Mean Shift reduction...")
-    stacked = _load_all_descriptors(train_descriptor_paths, "loading descriptors (mean shift)")
-
-    quantile = cfg.vocabulary.mean_shift.quantile
-    logger.info("Estimating Mean Shift bandwidth (quantile=%.3f) over %d descriptors...", quantile, stacked.shape[0])
-    # n_samples left at its sklearn default (None -> uses every row of
-    # `stacked`): no subsampling, per design.
-    bandwidth = estimate_bandwidth(stacked, quantile=quantile)
-    if bandwidth <= 0:
-        raise ValueError(
-            f"estimate_bandwidth returned a non-positive bandwidth ({bandwidth}) for "
-            f"quantile={quantile} -- try raising vocabulary.mean_shift.quantile."
-        )
-
-    logger.info("Fitting Mean Shift (bandwidth=%.6f)...", bandwidth)
-    ms = MeanShift(bandwidth=bandwidth, bin_seeding=cfg.vocabulary.mean_shift.bin_seeding)
-    ms.fit(stacked)
-    candidates = ms.cluster_centers_
-    logger.info("Mean Shift reduced %d descriptors to %d candidates", stacked.shape[0], candidates.shape[0])
-
-    candidate_vocab = Vocabulary(k=candidates.shape[0], cluster_centers=candidates, seed=cfg.vocabulary.seed)
-    atomic_write_pickle(out_path, candidate_vocab)
-    return candidate_vocab
-
-
 def build_vocabulary_from_descriptors(
     descriptors: np.ndarray,
     cfg: PipelineConfig,
     logger: logging.Logger,
     out_path: Path,
     k: Optional[int] = None,
+    metric: Literal["euclidean", "cosine"] = "euclidean",
 ) -> Vocabulary:
-    """Step 4 of the CVWS pipeline: final K-means quantization.
+    """Step 9 of the CVWS pipeline: final K-means quantization.
 
     Like `build_vocabulary`, but fits directly on an in-memory descriptor
-    matrix (the union of per-class-selected candidates from step 3, see
-    `pipeline.PipelineRunner._run_cvws_variants`) instead of loading
-    per-image descriptor files. `k` defaults to `cfg.vocabulary.k` — the
-    SAME final vocabulary size used by bovw_baseline/cnn_bovw's direct
-    K-means, so approaches stay comparable at equal feature dimension.
+    matrix (the CVWS pipeline's reconstructed, per-cluster-probability-
+    weighted candidate pool -- mapped back to the ORIGINAL, pre-UMAP
+    descriptor space by the caller, see `cvws_clustering.py`'s module
+    docstring and `pipeline.PipelineRunner._run_cvws_variants`) instead of
+    loading per-image descriptor files. `k` defaults to `cfg.vocabulary.k`
+    — the SAME final vocabulary size used by bovw_baseline/cnn_bovw's
+    direct K-means, so approaches stay comparable at equal feature
+    dimension.
+
+    `metric="cosine"` (used by the CVWS pipeline, per the spec's step 9)
+    L2-normalizes `descriptors` before fitting plain Euclidean K-means,
+    and tags the resulting `Vocabulary` accordingly so `.assign()`
+    normalizes consistently at histogram-encoding time too (see
+    `Vocabulary`'s docstring and `l2_normalize`). `metric="euclidean"`
+    (default) is the plain K-means used everywhere else.
     """
     if path_exists_and_valid(out_path):
         logger.info("Vocabulary cache hit: %s", out_path)
@@ -213,9 +198,12 @@ def build_vocabulary_from_descriptors(
             "selected candidate descriptors -- raise selection.n_candidates_per_class "
             "or lower vocabulary.k."
         )
-    logger.info("Fitting final K-means on %d selected candidates (K=%d)...", descriptors.shape[0], k)
-    centers = _fit_kmeans(descriptors, cfg, k)
-    vocab = Vocabulary(k=k, cluster_centers=centers, seed=cfg.vocabulary.seed)
+    fit_input = l2_normalize(descriptors.astype(np.float64)) if metric == "cosine" else descriptors
+    logger.info(
+        "Fitting final K-means (metric=%s) on %d selected candidates (K=%d)...", metric, descriptors.shape[0], k
+    )
+    centers = _fit_kmeans(fit_input, cfg, k)
+    vocab = Vocabulary(k=k, cluster_centers=centers, seed=cfg.vocabulary.seed, metric=metric)
     atomic_write_pickle(out_path, vocab)
     logger.info("Final vocabulary saved to %s", out_path)
     return vocab
@@ -253,9 +241,9 @@ def encode_histograms(
 @dataclass
 class VocabularyStats:
     """Per-class aggregate statistics over a vocabulary (the CVWS
-    candidate set in step 3, or a final vocabulary), computed once from
-    the raw (unnormalized) histograms of the training set. Feeds
-    `selection_strategies.py`.
+    pipeline's HDBSCAN cluster ids in step 6, or a final vocabulary),
+    computed once from the raw (unnormalized) histograms/occurrence counts
+    of the training set. Feeds `selection_strategies.py`.
 
     Attributes:
         k: vocabulary size.

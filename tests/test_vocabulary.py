@@ -1,12 +1,14 @@
-"""Tests for the CVWS candidate pipeline's building blocks in
-`src/vocabulary.py`: step 2 (`reduce_descriptors_mean_shift`), step 4
-(`build_vocabulary_from_descriptors`), and the per-image `per_class_matrix`
-that `compute_vocabulary_stats` now also populates (needed by
-`selection_strategies.py`'s entropy-based ICC/CED formulas).
+"""Tests for the CVWS pipeline's final-quantization building block in
+`src/vocabulary.py`: step 9 (`build_vocabulary_from_descriptors`,
+including its `metric="cosine"` mode -- see `Vocabulary.assign`), and the
+per-image `per_class_matrix` that `compute_vocabulary_stats` also
+populates (needed by `selection_strategies.py`'s entropy-based ICC/CED
+formulas). Steps 3-8 (UMAP/HDBSCAN/selection) live in
+`cvws_clustering.py` -- see `tests/test_cvws_clustering.py`.
 
-Uses small, well-separated synthetic descriptor blobs so Mean Shift and
-K-means both converge to an unambiguous, easy-to-assert result without
-requiring real images/SIFT/CNN extraction.
+Uses small, well-separated synthetic descriptor blobs so K-means converges
+to an unambiguous, easy-to-assert result without requiring real
+images/SIFT/CNN extraction.
 """
 from pathlib import Path
 
@@ -14,12 +16,7 @@ import numpy as np
 import pytest
 
 from src.config import PathsConfig, PipelineConfig
-from src.vocabulary import (
-    build_vocabulary_from_descriptors,
-    compute_vocabulary_stats,
-    encode_histograms,
-    reduce_descriptors_mean_shift,
-)
+from src.vocabulary import Vocabulary, build_vocabulary_from_descriptors, compute_vocabulary_stats, l2_normalize
 
 
 @pytest.fixture
@@ -28,45 +25,6 @@ def cfg(tmp_path) -> PipelineConfig:
     cfg.vocabulary.seed = 0
     cfg.vocabulary.minibatch = False  # exact KMeans: deterministic on tiny toy data
     return cfg
-
-
-def _write_descriptor_files(tmp_path: Path, per_image: dict) -> dict:
-    """Write {image_id: (N,D) ndarray} to .npy files, return {image_id: path}."""
-    paths = {}
-    desc_dir = tmp_path / "descriptors"
-    desc_dir.mkdir(exist_ok=True)
-    for image_id, arr in per_image.items():
-        p = desc_dir / f"{image_id}.npy"
-        np.save(p, arr)
-        paths[image_id] = str(p)
-    return paths
-
-
-def test_reduce_descriptors_mean_shift_finds_two_well_separated_blobs(cfg, tmp_path):
-    """Two far-apart, tight 2D blobs of descriptors should Mean-Shift down
-    to (approximately) two candidate centroids, each close to its blob's
-    true center -- a basic sanity check that step 2 actually reduces
-    redundancy rather than just returning every input point."""
-    rng = np.random.RandomState(0)
-    blob_a = rng.normal(loc=[0.0, 0.0], scale=0.05, size=(60, 2))
-    blob_b = rng.normal(loc=[10.0, 10.0], scale=0.05, size=(60, 2))
-    descriptor_paths = _write_descriptor_files(
-        tmp_path, {"img_a": blob_a.astype(np.float32), "img_b": blob_b.astype(np.float32)}
-    )
-
-    candidate_vocab = reduce_descriptors_mean_shift(
-        descriptor_paths, cfg, __import__("logging").getLogger("test"), tmp_path / "candidates.pkl"
-    )
-
-    # Tight, far-apart blobs -> Mean Shift should collapse each to ~1
-    # candidate (a handful at most is still acceptable), never anywhere
-    # close to the 120 raw input descriptors.
-    assert 1 <= candidate_vocab.k <= 4
-    # Every candidate should land near one of the two true blob centers.
-    centers = candidate_vocab.cluster_centers
-    dist_to_a = np.linalg.norm(centers - np.array([0.0, 0.0]), axis=1)
-    dist_to_b = np.linalg.norm(centers - np.array([10.0, 10.0]), axis=1)
-    assert np.all(np.minimum(dist_to_a, dist_to_b) < 1.0)
 
 
 def test_build_vocabulary_from_descriptors_matches_requested_k(cfg, tmp_path):
@@ -84,6 +42,7 @@ def test_build_vocabulary_from_descriptors_matches_requested_k(cfg, tmp_path):
     )
     assert vocab.k == 3
     assert vocab.cluster_centers.shape == (3, 2)
+    assert vocab.metric == "euclidean"  # default, unchanged behavior
 
 
 def test_build_vocabulary_from_descriptors_rejects_too_few_candidates(cfg, tmp_path):
@@ -92,6 +51,50 @@ def test_build_vocabulary_from_descriptors_rejects_too_few_candidates(cfg, tmp_p
         build_vocabulary_from_descriptors(
             descriptors, cfg, __import__("logging").getLogger("test"), tmp_path / "final_vocab.pkl", k=5
         )
+
+
+def test_l2_normalize_unit_norm_and_zero_safe():
+    x = np.array([[3.0, 4.0], [0.0, 0.0], [1.0, 0.0]])
+    out = l2_normalize(x)
+    assert np.linalg.norm(out[0]) == pytest.approx(1.0)
+    assert out[1].tolist() == [0.0, 0.0]  # zero row left as-is, no NaN
+    assert out[2].tolist() == [1.0, 0.0]
+
+
+def test_build_vocabulary_from_descriptors_cosine_metric(cfg, tmp_path):
+    """metric="cosine" (CVWS pipeline step 9): two rays of points at very
+    different magnitudes but the same two directions should still cluster
+    by DIRECTION, not by norm -- something plain Euclidean K-means on the
+    raw (unnormalized) vectors would get wrong."""
+    rng = np.random.RandomState(2)
+    # Direction A: near [1, 0], magnitudes from 1 to 50 (huge spread).
+    dir_a = np.array([1.0, 0.0])
+    mags_a = rng.uniform(1.0, 50.0, size=30)
+    angles_a = rng.normal(0.0, 0.02, size=30)
+    pts_a = np.stack([mags_a * np.cos(angles_a), mags_a * np.sin(angles_a)], axis=1)
+    # Direction B: near [0, 1], same wide magnitude spread.
+    mags_b = rng.uniform(1.0, 50.0, size=30)
+    angles_b = np.pi / 2 + rng.normal(0.0, 0.02, size=30)
+    pts_b = np.stack([mags_b * np.cos(angles_b), mags_b * np.sin(angles_b)], axis=1)
+    descriptors = np.concatenate([pts_a, pts_b], axis=0).astype(np.float32)
+
+    vocab = build_vocabulary_from_descriptors(
+        descriptors,
+        cfg,
+        __import__("logging").getLogger("test"),
+        tmp_path / "cosine_vocab.pkl",
+        k=2,
+        metric="cosine",
+    )
+    assert vocab.metric == "cosine"
+    # Every point from direction A should be assigned to the same word,
+    # and likewise for direction B, regardless of their wildly different
+    # norms -- a direct check that assignment is norm-invariant.
+    assign_a = vocab.assign(pts_a.astype(np.float32))
+    assign_b = vocab.assign(pts_b.astype(np.float32))
+    assert len(set(assign_a.tolist())) == 1
+    assert len(set(assign_b.tolist())) == 1
+    assert assign_a[0] != assign_b[0]
 
 
 def test_compute_vocabulary_stats_populates_per_class_matrix(tmp_path):
