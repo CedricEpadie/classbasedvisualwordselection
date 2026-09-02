@@ -155,15 +155,15 @@ def reduce_and_cluster(
     # so re-normalize its output before HDBSCAN.
     d_umap_norm = l2_normalize(np.asarray(d_umap, dtype=np.float32))
 
-    min_cluster_size = max(2, int(round(n_total * cfg.vocabulary.hdbscan.min_cluster_size_pct / 100.0)))
-    min_samples = max(1, int(round(min_cluster_size * cfg.vocabulary.hdbscan.min_samples_pct / 100.0)))
+    min_cluster_size = cfg.vocabulary.hdbscan.min_cluster_size
+    min_samples = cfg.vocabulary.hdbscan.min_samples
     logger.info(
         "Fitting HDBSCAN (min_cluster_size=%d, min_samples=%d) on %d UMAP-reduced descriptors...",
         min_cluster_size,
         min_samples,
         n_total,
     )
-    clusterer = HDBSCAN(min_cluster_size=min_cluster_size, min_samples=min_samples, metric="euclidean")
+    clusterer = HDBSCAN(min_cluster_size=min_cluster_size, min_samples=min_samples, metric="euclidean", cluster_selection_method="leaf")
     clusterer.fit(d_umap_norm)
     raw_labels = np.asarray(clusterer.labels_)
     raw_probabilities = np.asarray(clusterer.probabilities_)
@@ -176,7 +176,7 @@ def reduce_and_cluster(
     if n_clusters_found == 0:
         raise ValueError(
             "HDBSCAN found no clusters (every descriptor was labeled as noise) -- "
-            "try lowering vocabulary.hdbscan.min_cluster_size_pct/min_samples_pct."
+            "try lowering vocabulary.hdbscan.min_cluster_size/min_samples."
         )
     remap = {old: new for new, old in enumerate(unique_labels)}
     remapped_labels = np.array([remap[label] for label in raw_labels[keep_mask]], dtype=np.int32)

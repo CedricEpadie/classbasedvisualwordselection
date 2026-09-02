@@ -70,8 +70,8 @@ vocabulary:
   # Step 4 ("Clustering non supervisé") -- percentages of the training
   # descriptor count / of min_cluster_size, so they scale with corpus size.
   hdbscan:
-    min_cluster_size_pct: 0.01    # 0.01% of the training descriptor count
-    min_samples_pct: 1.0          # 1% of min_cluster_size
+    min_cluster_size: 3    # 3 descriptors
+    min_samples: 1          # 1 descriptor
 
 selection:
   # The 3 cluster-scoring strategies from "Stratégie de sélection des mots

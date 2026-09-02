@@ -263,10 +263,8 @@ already-built vocabulary after the fact:
    (default 10). The correspondence between each reduced vector and its
    original descriptor is preserved.
 4. **Unsupervised clustering (HDBSCAN, cosine).** HDBSCAN clusters the
-   UMAP-reduced descriptors, with `min_cluster_size`/`min_samples`
-   expressed as percentages of the descriptor count
-   (`vocabulary.hdbscan.min_cluster_size_pct`/`min_samples_pct`) so they
-   scale with corpus size. Neither HDBSCAN nor the final K-means (step 9)
+   UMAP-reduced descriptors, with `min_cluster_size = 3`/`min_samples = 1`
+   .Neither HDBSCAN nor the final K-means (step 9)
    support cosine distance natively in scikit-learn (HDBSCAN's cosine mode
    forces an O(N²) brute-force search; K-means has no cosine variant at
    all), so both are implemented via the standard, mathematically

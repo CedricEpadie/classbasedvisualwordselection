@@ -103,14 +103,14 @@ class HDBSCANConfig(StrictModel):
     """Step 4 ('Clustering non supervisé'). Hyperparameters are expressed
     as PERCENTAGES of the training descriptor count / of min_cluster_size,
     per the spec, so they scale automatically with corpus size:
-        min_cluster_size = min_cluster_size_pct% of n_training_descriptors
-        min_samples      = min_samples_pct% of min_cluster_size
+        min_cluster_size = 3
+        min_samples      = 1
     Both are clamped to sklearn's minimums (min_cluster_size >= 2,
     min_samples >= 1) — see `cvws_clustering.reduce_and_cluster`.
     """
 
-    min_cluster_size_pct: float = 0.01  # 0.01% of the descriptor count
-    min_samples_pct: float = 1.0  # 1% of min_cluster_size
+    min_cluster_size: int = 3  # 3 descriptors
+    min_samples: int = 1  # 1 descriptor
 
 
 class VocabularyConfig(StrictModel):
