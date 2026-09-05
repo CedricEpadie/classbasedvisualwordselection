@@ -64,13 +64,13 @@ vocabulary:
   # used by bovw_cvws/cnn_bovw_cvws/vit_cvws; bovw_baseline/cnn_bovw
   # ignore this entirely.
   umap:
-    n_components: 10              # d = 10, per the spec
-    n_neighbors: 15
+    n_components: 64              # d = 10, per the spec
+    n_neighbors: 10
     min_dist: 0.1
   # Step 4 ("Clustering non supervisé") -- percentages of the training
   # descriptor count / of min_cluster_size, so they scale with corpus size.
   hdbscan:
-    min_cluster_size: 3    # 3 descriptors
+    min_cluster_size: 2    # 2 descriptors
     min_samples: 1          # 1 descriptor
 
 selection:
@@ -116,6 +116,7 @@ approaches:
     - bovw_cvws
     - cnn_bovw
     - cnn_bovw_cvws
+    - vit_bovw
     - vit_cvws
     - cnn_end_to_end
     - vit_end_to_end

@@ -217,7 +217,7 @@ class ApproachesConfig(StrictModel):
     # rationale as vit_end_to_end above.
     # =======================================================================
     enabled: List[
-        Literal["bovw_baseline", "bovw_cvws", "cnn_bovw", "cnn_bovw_cvws", "vit_cvws", "cnn_end_to_end", "vit_end_to_end"]
+        Literal["bovw_baseline", "bovw_cvws", "cnn_bovw", "cnn_bovw_cvws", "vit_cvws","vit_bovw", "cnn_end_to_end", "vit_end_to_end"]
     ] = Field(
         default_factory=lambda: ["bovw_baseline", "bovw_cvws", "cnn_bovw", "cnn_bovw_cvws"]
     )

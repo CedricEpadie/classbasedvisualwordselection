@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
-from sklearn.cluster import HDBSCAN
+import hdbscan
 from tqdm import tqdm
 
 from src.config import PipelineConfig
@@ -163,8 +163,14 @@ def reduce_and_cluster(
         min_samples,
         n_total,
     )
-    clusterer = HDBSCAN(min_cluster_size=min_cluster_size, min_samples=min_samples, metric="euclidean", cluster_selection_method="leaf")
-    clusterer.fit(d_umap_norm)
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        metric='euclidean',
+        leaf_size=80,
+        approx_min_span_tree=True,
+        cluster_selection_method='leaf'
+    )
     raw_labels = np.asarray(clusterer.labels_)
     raw_probabilities = np.asarray(clusterer.probabilities_)
 

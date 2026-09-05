@@ -63,7 +63,7 @@ from src.vocabulary import Vocabulary, build_vocabulary, build_vocabulary_from_d
 # --list-approaches can introspect it without constructing a config first.
 # === ViT (option B): "vit_end_to_end" added to the list of runnable
 # approaches (see PipelineRunner.run_vit_end_to_end below). ===
-APPROACHES: List[str] = ["bovw_baseline", "bovw_cvws", "cnn_bovw", "cnn_bovw_cvws", "vit_cvws", "cnn_end_to_end", "vit_end_to_end"]
+APPROACHES: List[str] = ["bovw_baseline", "bovw_cvws", "cnn_bovw", "cnn_bovw_cvws", "vit_bovw", "vit_cvws", "cnn_end_to_end", "vit_end_to_end"]
 
 
 # --------------------------------------------------------------------------- #
@@ -525,6 +525,7 @@ class PipelineRunner:
         return self._run_cvws_variants("cnn_bovw_cvws", local_paths, train_ids, test_ids, labels, tag="cnn")
 
     # === ViT (cvws) =========================================================
+    
     def run_vit_cvws(self) -> List[dict]:
         """CVWS ('Ma Methode' for ViT): preprocessing -> ViT patch-token
         local features -> 11-step CVWS pipeline (UMAP + HDBSCAN +
@@ -566,6 +567,19 @@ class PipelineRunner:
             # `include_vocabulary` note on `_training_hash` above.
             training_hash=self._training_hash(include_vocabulary=False),
         )
+        
+    def run_vit_bovw(self) -> List[dict]:
+        preprocessed, labels = self._preprocess()
+        ids = list(preprocessed.keys())
+        train_ids, test_ids = self._train_test_split(ids, labels)
+        local_paths = self._extract_vit_local(preprocessed)
+        vocab, histograms = self._build_vocab_and_histograms(local_paths, train_ids, tag="vit")
+        X_train, y_train = self._load_histogram_matrix(histograms, train_ids, labels)
+        X_test, y_test = self._load_histogram_matrix(histograms, test_ids, labels)
+        return self._train_and_evaluate(
+            "vit_bovw", "full", X_train, y_train, X_test, y_test, test_ids, nb_vw=vocab.k
+        )
+    
 
     def _load_feature_matrix(
         self, feature_paths: Dict[str, str], ids: List[str], labels: Dict[str, str]
@@ -741,6 +755,7 @@ class PipelineRunner:
             "bovw_cvws": self.run_bovw_cvws,
             "cnn_bovw": self.run_cnn_bovw,
             "cnn_bovw_cvws": self.run_cnn_bovw_cvws,
+            "vit_bovw": self.run_vit_bovw,
             "vit_cvws": self.run_vit_cvws,
             "cnn_end_to_end": self.run_cnn_end_to_end,
             "vit_end_to_end": self.run_vit_end_to_end,

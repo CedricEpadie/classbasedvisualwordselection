@@ -10,3 +10,4 @@ pyarrow>=14.0
 pydantic>=2.5
 pyyaml>=6.0
 tqdm>=4.66
+hdbscan>=0.8
