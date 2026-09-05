@@ -171,6 +171,7 @@ def reduce_and_cluster(
         approx_min_span_tree=True,
         cluster_selection_method='leaf'
     )
+    clusterer.fit(d_umap_norm)
     raw_labels = np.asarray(clusterer.labels_)
     raw_probabilities = np.asarray(clusterer.probabilities_)
 
