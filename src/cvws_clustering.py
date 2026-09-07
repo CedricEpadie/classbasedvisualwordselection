@@ -17,6 +17,20 @@ vocabulaire visuel par sélection de mots visuels basée sur la classe"
        (nearest its medoid) to the final candidate pool, in their
        ORIGINAL (pre-UMAP) descriptor space
 
+    2026-09 update (bovw_cvws only, `selection.reconstruction_mode ==
+    "weighted"`, the default): step 8 above is replaced by
+    `select_clusters_and_build_weighted_candidates`, which targets a fixed
+    total pool size N (`selection.candidate_pool_size`) split N/|C| per
+    class and, within each class, across its selected clusters in
+    proportion to their selection score (see that function's own
+    docstring, and `allocation.allocate_counts_proportional`) -- addressing
+    the old step 8's pool being tiny (~n_candidates_per_class * |C|) next
+    to N. `selection.reconstruction_mode == "legacy"` keeps the original
+    step 8 above. cnn_bovw_cvws/vit_cvws no longer go through this
+    candidate-pool + final-K-means path at all -- see
+    `position_reconstruction.py` and `pipeline.PipelineRunner.
+    _run_position_cvws_variant` for their own, per-position reconstruction.
+
 Steps 1-2 (preprocessing, extraction+provenance) and 9-11 (final cosine
 K-means, histogram encoding, classification) live in `vocabulary.py`
 (`build_vocabulary_from_descriptors(..., metric="cosine")`,
@@ -49,6 +63,7 @@ import numpy as np
 import hdbscan
 from tqdm import tqdm
 
+from src.allocation import allocate_counts_proportional, pick_with_duplication
 from src.config import PipelineConfig
 from src.selection_strategies import VisualWordSelectionStrategy
 from src.utils.io_utils import path_exists_and_valid, read_pickle, atomic_write_pickle
@@ -339,6 +354,163 @@ def select_clusters_and_build_candidates(
         "n_total_clusters": clustering_result.n_clusters,
         "per_class_selected_clusters": per_class_selected,
         "per_cluster_selection": per_cluster_audit,
+        "n_candidate_descriptors": int(candidate_descriptors.shape[0]),
+    }
+    return candidate_descriptors, audit_info
+
+
+# --------------------------------------------------------------------------- #
+# bovw_cvws step 8, updated variant: score-weighted N-vector reconstruction
+# --------------------------------------------------------------------------- #
+def select_clusters_and_build_weighted_candidates(
+    clustering_result: ClusteringResult,
+    stats: VocabularyStats,
+    strategy: VisualWordSelectionStrategy,
+    n_candidates_per_class: int,
+    candidate_pool_size: int,
+    descriptor_paths: Dict[str, str],
+    logger: logging.Logger,
+) -> Tuple[np.ndarray, dict]:
+    """Updated step 8 for bovw_cvws only (per the 2026-09 methodology
+    revision): instead of each selected cluster contributing a number of
+    descriptors equal to its `selection_count` (the old
+    `select_clusters_and_build_candidates`, whose final candidate pool ends
+    up around `n_candidates_per_class * |C|` descriptors -- tiny next to the
+    N descriptors bovw_baseline's direct K-means fits on), build a pool of
+    exactly `candidate_pool_size` (= N) descriptors, split evenly across
+    classes (N / |C|) and then, within each class, across its own
+    `n_candidates_per_class` selected clusters IN PROPORTION TO THEIR
+    SELECTION SCORE -- so the final K-means (step 9) sees as much data as
+    the baseline, still concentrated on the class-discriminant clusters
+    the strategy picked out.
+
+    For each class c:
+      1. Step 7 (unchanged): `strategy.select_top_n` keeps c's own top
+         `n_candidates_per_class` cluster ids.
+      2. `n_per_class = N // |C|` (the leftover from integer division is
+         distributed across classes via `allocate_counts_proportional`
+         against a uniform weight, so classes still sum to exactly N).
+      3. `allocate_counts_proportional(scores_of_selected_clusters,
+         n_per_class)` (largest-remainder method, see `allocation.py`)
+         turns each selected cluster's raw score into an integer vector
+         count -- this is exactly the worked example from the spec
+         (scores [0.8,0.7,0.6,0.5,0.4], n_per_class=250 -> [67,58,50,42,33]).
+      4. Each cluster contributes its allocated count of member
+         descriptors, highest-HDBSCAN-probability first (nearest its
+         medoid, same ordering as the legacy step 8); if the allocated
+         count exceeds the cluster's own member count, members are
+         duplicated (cycling through the same probability-sorted order --
+         see `allocation.pick_with_duplication`) rather than erroring, per
+         the spec's confirmed edge-case handling.
+
+    Unlike the legacy function, a cluster selected by several classes
+    contributes SEPARATELY to each of those classes' allocations (its
+    member descriptors can legitimately appear more than once in the
+    returned pool, once per class that selected it) -- there is no shared
+    `selection_count` step here, since each class's share of N is
+    determined independently by its own score distribution.
+
+    Returns `(candidate_descriptors, audit_info)`, same shape/contract as
+    `select_clusters_and_build_candidates`: `candidate_descriptors` is
+    `(candidate_pool_size, D_orig)` (original, pre-UMAP descriptor space);
+    `audit_info` additionally records each class's per-cluster allocation
+    for interpretability.
+    """
+    classes = stats.classes
+    n_classes = len(classes)
+    if n_classes == 0:
+        raise ValueError("Cannot build weighted candidates with zero classes")
+
+    # --- Step 7 (unchanged): per-class top-N selected cluster ids ---
+    score_matrix = strategy.score_matrix(stats)
+    per_class_selected: Dict[str, List[int]] = {
+        c: sorted(int(v) for v in strategy.select_top_n(stats, c, n_candidates_per_class)) for c in classes
+    }
+
+    # --- N split evenly across classes (remainder distributed via the same
+    # largest-remainder method, against uniform per-class weights) ---
+    per_class_pool_size = allocate_counts_proportional([1.0] * n_classes, candidate_pool_size)
+
+    # --- Group surviving descriptor rows by cluster id (only for clusters
+    # selected by at least one class) ---
+    all_selected_clusters = {cid for ids in per_class_selected.values() for cid in ids}
+    cluster_to_rows: Dict[int, List[int]] = {}
+    for row_idx, cid in enumerate(clustering_result.cluster_labels):
+        cid = int(cid)
+        if cid in all_selected_clusters:
+            cluster_to_rows.setdefault(cid, []).append(row_idx)
+    # Highest HDBSCAN membership probability first, precomputed once per
+    # cluster (shared across every class that happens to select it).
+    cluster_rows_by_probability: Dict[int, List[int]] = {
+        cid: sorted(rows, key=lambda r: -clustering_result.probabilities[r]) for cid, rows in cluster_to_rows.items()
+    }
+
+    chosen_rows: List[int] = []
+    per_class_audit: Dict[str, dict] = {}
+    for c, n_for_class in zip(classes, per_class_pool_size):
+        selected_ids = per_class_selected[c]
+        per_cluster_audit: Dict[str, dict] = {}
+        if not selected_ids:
+            per_class_audit[c] = {"n_target": n_for_class, "per_cluster_allocation": {}}
+            continue
+        cluster_scores = [float(score_matrix[c][cid]) for cid in selected_ids]
+        allocations = allocate_counts_proportional(cluster_scores, n_for_class)
+        for cid, count in zip(selected_ids, allocations):
+            member_rows = cluster_rows_by_probability.get(cid, [])
+            if count > 0 and not member_rows:
+                # Selected but has no surviving members at all (shouldn't
+                # happen in practice -- select_top_n only ranks clusters
+                # that exist -- but guard rather than crash on a
+                # pathological/empty cluster).
+                logger.warning("Selected cluster %d for class %s has no members; skipping its allocation", cid, c)
+                picked_rows: List[int] = []
+            else:
+                picked_rows = [member_rows[i] for i in pick_with_duplication(list(range(len(member_rows))), count)]
+            chosen_rows.extend(picked_rows)
+            per_cluster_audit[str(cid)] = {
+                "score": float(score_matrix[c][cid]),
+                "cluster_size": len(member_rows),
+                "n_allocated": count,
+                "n_duplicated": max(0, count - len(member_rows)),
+            }
+        per_class_audit[c] = {"n_target": n_for_class, "per_cluster_allocation": per_cluster_audit}
+
+    # --- Gather the ORIGINAL (pre-UMAP) descriptor vectors for the chosen
+    # rows (duplicated rows are re-fetched, not aliased, so the returned
+    # array is a plain, independent (N, D) matrix ready for K-means) ---
+    rows_by_image: Dict[str, List[int]] = {}
+    for row_idx in chosen_rows:
+        image_id = clustering_result.image_ids[row_idx]
+        local_idx = int(clustering_result.local_indices[row_idx])
+        rows_by_image.setdefault(image_id, []).append(local_idx)
+
+    loaded_by_image: Dict[str, np.ndarray] = {}
+    candidate_vectors: List[np.ndarray] = []
+    for row_idx in chosen_rows:
+        image_id = clustering_result.image_ids[row_idx]
+        local_idx = int(clustering_result.local_indices[row_idx])
+        if image_id not in loaded_by_image:
+            loaded_by_image[image_id] = np.load(descriptor_paths[image_id])
+        candidate_vectors.append(loaded_by_image[image_id][local_idx])
+    candidate_descriptors = (
+        np.stack(candidate_vectors, axis=0) if candidate_vectors else np.zeros((0, 0), dtype=np.float32)
+    )
+
+    logger.info(
+        "CVWS weighted candidate reconstruction (%s): %d classes, target N=%d -> %d candidate descriptors",
+        strategy.name,
+        n_classes,
+        candidate_pool_size,
+        candidate_descriptors.shape[0],
+    )
+
+    audit_info = {
+        "strategy": strategy.name,
+        "n_candidates_per_class": n_candidates_per_class,
+        "candidate_pool_size": candidate_pool_size,
+        "n_total_clusters": clustering_result.n_clusters,
+        "per_class_selected_clusters": per_class_selected,
+        "per_class_allocation": per_class_audit,
         "n_candidate_descriptors": int(candidate_descriptors.shape[0]),
     }
     return candidate_descriptors, audit_info

@@ -19,7 +19,12 @@ import logging
 import numpy as np
 import pytest
 
-from src.cvws_clustering import ClusteringResult, compute_cluster_stats, select_clusters_and_build_candidates
+from src.cvws_clustering import (
+    ClusteringResult,
+    compute_cluster_stats,
+    select_clusters_and_build_candidates,
+    select_clusters_and_build_weighted_candidates,
+)
 from src.selection_strategies import GlobalClassFrequency
 
 LOGGER = logging.getLogger("test")
@@ -175,3 +180,100 @@ def test_select_clusters_clamps_when_selection_count_exceeds_cluster_size(
     assert info["cluster_size"] == 1  # but it only has 1 member
     assert info["n_taken"] == 1  # clamped, not an error
     assert audit["n_candidate_descriptors"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# 2026-09 update: select_clusters_and_build_weighted_candidates (bovw_cvws's
+# updated step 8 -- score-weighted N-vector reconstruction, see
+# `allocation.allocate_counts_proportional`/`pick_with_duplication`).
+# --------------------------------------------------------------------------- #
+def test_weighted_candidates_pool_size_matches_target_exactly(clustering_result, labels, descriptor_paths):
+    """candidate_pool_size=10 (an arbitrary N unrelated to the raw
+    descriptor count) must be hit EXACTLY, split 5/5 across the 2 classes
+    regardless of how the per-cluster scores round."""
+    stats = compute_cluster_stats(clustering_result, labels, LOGGER)
+    strategy = GlobalClassFrequency()
+
+    candidates, audit = select_clusters_and_build_weighted_candidates(
+        clustering_result,
+        stats,
+        strategy,
+        n_candidates_per_class=2,
+        candidate_pool_size=10,
+        descriptor_paths=descriptor_paths,
+        logger=LOGGER,
+    )
+
+    assert candidates.shape[0] == 10
+    assert audit["n_candidate_descriptors"] == 10
+    assert audit["per_class_allocation"]["cat"]["n_target"] == 5
+    assert audit["per_class_allocation"]["dog"]["n_target"] == 5
+
+
+def test_weighted_candidates_allocate_proportional_to_score_with_duplication(
+    clustering_result, labels, descriptor_paths
+):
+    """cat's top-2 clusters are 0 (F=2, 2 members) and 1 (F=1, 1 member).
+    Its 5-vector share splits proportional to score -> [3, 2]
+    (allocate_counts_proportional([2,1], 5)) -- cluster 0 (2 members) is
+    only mildly duplicated (3 > 2 -> 1 duplicate), cluster 1 (1 member) is
+    duplicated to fill its 2 slots."""
+    stats = compute_cluster_stats(clustering_result, labels, LOGGER)
+    strategy = GlobalClassFrequency()
+
+    _candidates, audit = select_clusters_and_build_weighted_candidates(
+        clustering_result,
+        stats,
+        strategy,
+        n_candidates_per_class=2,
+        candidate_pool_size=10,
+        descriptor_paths=descriptor_paths,
+        logger=LOGGER,
+    )
+
+    cat_alloc = audit["per_class_allocation"]["cat"]["per_cluster_allocation"]
+    assert cat_alloc["0"]["n_allocated"] == 3
+    assert cat_alloc["0"]["n_duplicated"] == 1  # 3 allocated, only 2 members
+    assert cat_alloc["1"]["n_allocated"] == 2
+    assert cat_alloc["1"]["n_duplicated"] == 1  # 2 allocated, only 1 member
+
+    # dog's F=[0,0,2]: cluster 0 gets a 0 share (its score is 0), cluster 2
+    # gets the full 5.
+    dog_alloc = audit["per_class_allocation"]["dog"]["per_cluster_allocation"]
+    assert dog_alloc["0"]["n_allocated"] == 0
+    assert dog_alloc["2"]["n_allocated"] == 5
+    assert dog_alloc["2"]["n_duplicated"] == 3  # 5 allocated, only 2 members
+
+
+def test_weighted_candidates_duplicated_vectors_are_independent_rows(clustering_result, labels, descriptor_paths):
+    """Duplicated rows must be genuine, independent copies of the original
+    descriptor (not aliased memory), and every returned row must trace
+    back to a real descriptor -- no zero-padding or invented values."""
+    from collections import Counter
+
+    stats = compute_cluster_stats(clustering_result, labels, LOGGER)
+    strategy = GlobalClassFrequency()
+
+    candidates, _audit = select_clusters_and_build_weighted_candidates(
+        clustering_result,
+        stats,
+        strategy,
+        n_candidates_per_class=2,
+        candidate_pool_size=10,
+        descriptor_paths=descriptor_paths,
+        logger=LOGGER,
+    )
+
+    cat_1 = np.load(descriptor_paths["cat_1"])
+    dog_1 = np.load(descriptor_paths["dog_1"])
+    counts = Counter(tuple(row) for row in candidates)
+    # cat: cluster 0 (cat_1 rows 0,1) contributes 3 total (2 distinct + 1
+    # duplicate); cluster 1 (cat_1 row 2 only) contributes 2 (both
+    # duplicates of the same row).
+    assert counts[tuple(cat_1[0])] + counts[tuple(cat_1[1])] == 3
+    assert counts[tuple(cat_1[2])] == 2
+    # dog: cluster 2 (dog_1 rows 0,1) contributes 5 total.
+    assert counts[tuple(dog_1[0])] + counts[tuple(dog_1[1])] == 5
+    # Mutating one returned row must not affect another (independent copies).
+    candidates[0, 0] = -999.0
+    assert not np.any(np.all(candidates[1:] == candidates[0], axis=1))

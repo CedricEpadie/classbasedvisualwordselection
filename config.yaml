@@ -92,6 +92,16 @@ selection:
   # vocabulary.k alone.
   n_candidates_per_class: 50
 
+  # --- 2026-09 update: bovw_cvws's weighted step 8 (see
+  # src/cvws_clustering.select_clusters_and_build_weighted_candidates) ---
+  reconstruction_mode: weighted   # "weighted" (default) or "legacy"
+  candidate_pool_size: null        # null = number of surviving training descriptors (N)
+
+  # --- 2026-09 update: cnn_bovw_cvws/vit_cvws's per-position
+  # reconstruction (see src/position_reconstruction.py) ---
+  position_top_n: 5                # top words kept per (class, position)
+  images_per_class: null           # null = n_train_images // n_classes (y)
+
 classifiers:
   enabled:
     - mlp

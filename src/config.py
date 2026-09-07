@@ -171,6 +171,31 @@ class SelectionConfig(StrictModel):
     # descriptor candidates directly.
     n_candidates_per_class: int = 50
 
+    # --- 2026-09 update: bovw_cvws's weighted step 8 (see
+    # `cvws_clustering.select_clusters_and_build_weighted_candidates`) ---
+    # "legacy" = original step 8 (selection_count-based, tiny candidate
+    # pool); "weighted" (default) = score-proportional N/|C| allocation.
+    # Only consulted for the bovw_cvws approach; cnn_bovw_cvws/vit_cvws use
+    # `position_top_n`/`images_per_class` below instead (see
+    # `PipelineRunner._run_position_cvws_variant`).
+    reconstruction_mode: Literal["legacy", "weighted"] = "weighted"
+    # N: total size of the weighted candidate pool feeding step 9's final
+    # K-means. None (default) = use the total number of surviving (non-
+    # noise) training descriptors, so the weighted pool is exactly as large
+    # as the descriptor set bovw_baseline's direct K-means would fit on.
+    candidate_pool_size: Optional[int] = None
+
+    # --- 2026-09 update: cnn_bovw_cvws/vit_cvws's per-position
+    # reconstruction (see `position_reconstruction.py`) ---
+    # top_n words (cluster ids) kept per (class, position) -- the
+    # per-position analogue of `n_candidates_per_class` above.
+    position_top_n: int = 5
+    # y: number of synthetic images reconstructed per class. None
+    # (default) = number of TRAINING images divided by the number of
+    # classes (floor), so every class contributes an equal, balanced share
+    # of synthetic training samples.
+    images_per_class: Optional[int] = None
+
 
 class ClassifiersConfig(StrictModel):
     enabled: List[

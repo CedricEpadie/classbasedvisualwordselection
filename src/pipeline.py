@@ -49,7 +49,15 @@ from sklearn.model_selection import train_test_split
 
 from src.classifiers import build_classifier
 from src.config import PipelineConfig, ensure_run_id
-from src.cvws_clustering import compute_cluster_stats, reduce_and_cluster, select_clusters_and_build_candidates
+from src.cvws_clustering import (
+    ClusteringResult,
+    compute_cluster_stats,
+    reduce_and_cluster,
+    select_clusters_and_build_candidates,
+    select_clusters_and_build_weighted_candidates,
+)
+from src.position_reconstruction import build_position_representatives, build_reconstructed_images, select_all_position_words
+from src.tail_encoders import CnnTailEncoder, ViTTailEncoder
 from src.feature_extraction import CnnExtractor, ViTExtractor, extract_features_dataset  # === ViT (option B): ViTExtractor added ===
 from src.pipeline_state import PipelineState
 from src.preprocessing import preprocess_dataset
@@ -516,26 +524,38 @@ class PipelineRunner:
         )
 
     def run_cnn_bovw_cvws(self) -> List[dict]:
-        """CVWS ('Ma Methode' for CNN): preprocessing -> CNN local features
-        -> 11-step CVWS pipeline -> classifiers. See `_run_cvws_variants`."""
+        """CVWS for CNN (2026-09 methodology update): preprocessing -> CNN
+        local features -> UMAP/HDBSCAN + per-position, per-class word
+        selection -> synthetic per-class image reconstruction -> CNN-tail
+        encoding -> classifiers. See `_run_position_cvws_variant` and
+        `position_reconstruction.py`'s module docstring (no more K-means/
+        histogram step for this approach -- superseded by that update)."""
         preprocessed, labels = self._preprocess()
         ids = list(preprocessed.keys())
         train_ids, test_ids = self._train_test_split(ids, labels)
         local_paths = self._extract_cnn_local(preprocessed)
-        return self._run_cvws_variants("cnn_bovw_cvws", local_paths, train_ids, test_ids, labels, tag="cnn")
+        return self._run_position_cvws_variant(
+            "cnn_bovw_cvws", "cnn", local_paths, train_ids, test_ids, labels, tag="cnn"
+        )
 
     # === ViT (cvws) =========================================================
     
     def run_vit_cvws(self) -> List[dict]:
-        """CVWS ('Ma Methode' for ViT): preprocessing -> ViT patch-token
-        local features -> 11-step CVWS pipeline (UMAP + HDBSCAN +
-        per-class selection + final cosine K-means) -> classifiers.
-        See `_run_cvws_variants`."""
+        """CVWS for ViT (2026-09 methodology update): preprocessing -> ViT
+        patch-token local features -> UMAP/HDBSCAN + per-position,
+        per-class word selection -> synthetic per-class "image"
+        (patch-token sequence) reconstruction -> ViT-encoder tail encoding
+        ([CLS] + reconstructed patches + positional embedding) ->
+        classifiers. See `_run_position_cvws_variant` and
+        `position_reconstruction.py`'s module docstring (no more K-means/
+        histogram step for this approach -- superseded by that update)."""
         preprocessed, labels = self._preprocess()
         ids = list(preprocessed.keys())
         train_ids, test_ids = self._train_test_split(ids, labels)
         local_paths = self._extract_vit_local(preprocessed)
-        return self._run_cvws_variants("vit_cvws", local_paths, train_ids, test_ids, labels, tag="vit")
+        return self._run_position_cvws_variant(
+            "vit_cvws", "vit", local_paths, train_ids, test_ids, labels, tag="vit"
+        )
     # === fin ViT (cvws) ======================================================
 
     def run_vit_end_to_end(self) -> List[dict]:
@@ -605,36 +625,32 @@ class PipelineRunner:
     # 7-10 (and therefore the final vocabulary itself) run once PER
     # strategy, since different strategies select different clusters.
     # ------------------------------------------------------------------ #
-    def _run_cvws_variants(
+    def _umap_hdbscan_and_stats(
         self,
-        approach: str,
         descriptor_paths: Dict[str, str],
         train_ids: List[str],
-        test_ids: List[str],
         labels: Dict[str, str],
         tag: str,
-    ) -> List[dict]:
-        # Both UMAP/HDBSCAN's own params and the descriptors feeding them
-        # (feature_extraction) must invalidate this cache.
+    ) -> Tuple[ClusteringResult, "VocabularyStats"]:
+        """Steps 3-6, shared verbatim by `_run_cvws_variants` (bovw_cvws)
+        and `_run_position_cvws_variant` (cnn_bovw_cvws/vit_cvws): UMAP ->
+        HDBSCAN (cosine) -> drop noise -> symbolic re-encoding + per-class
+        cluster stats. Cached under the SAME path for a given `tag`
+        regardless of which of the two callers runs first, since the
+        clustering itself doesn't depend on how its output is later
+        turned into a final vocabulary (bovw_cvws) or per-position
+        synthetic images (cnn_bovw_cvws/vit_cvws)."""
         h_clustering = self.cfg.section_hash("vocabulary", "feature_extraction")
 
-        # --- Steps 3-5: UMAP -> HDBSCAN -> drop noise (train descriptors only) ---
         clustering_dir = ensure_dir(Path(self.cfg.paths.output_dir) / "vocabulary")
         clustering_path = clustering_dir / f"{self.cfg.dataset_name}_{tag}_umap_hdbscan.pkl"
         train_descriptors = {i: descriptor_paths[i] for i in train_ids}
         clustering_result = self._step(
-            f"reduce_and_cluster_{tag}",
-            h_clustering,
-            reduce_and_cluster,
-            train_descriptors,
-            self.cfg,
-            self.logger,
-            clustering_path,
+            f"reduce_and_cluster_{tag}", h_clustering, reduce_and_cluster, train_descriptors, self.cfg, self.logger, clustering_path
         )
         if clustering_result is None:
             clustering_result = read_pickle(clustering_path)
 
-        # --- Step 6: symbolic re-encoding + per-class cluster stats (train only) ---
         stats_dir = ensure_dir(Path(self.cfg.paths.output_dir) / "vocabulary_stats")
         stats_path = stats_dir / f"{self.cfg.dataset_name}_{tag}_umap_hdbscan.pkl"
 
@@ -646,6 +662,160 @@ class PipelineRunner:
         stats = self._step(f"compute_cluster_stats_{tag}", h_clustering, _compute_and_persist_stats)
         if stats is None:
             stats = read_pickle(stats_path)
+        return clustering_result, stats
+
+    # ------------------------------------------------------------------ #
+    # Position-based reconstruction pipeline (cnn_bovw_cvws / vit_cvws only,
+    # 2026-09 methodology update) — steps 3-6 shared with bovw_cvws (see
+    # `_umap_hdbscan_and_stats`), then:
+    #   7-8. per-position, per-class word ranking + one representative
+    #        vector per selected (position, cluster)     -> position_reconstruction.py
+    #   9.   y synthetic images per class, encoded via the CNN/ViT tail
+    #        (same backbone, downstream of the local-descriptor hook)
+    #        -> synthetic TRAINING vectors
+    #   10.  REAL test images encoded via the standard global pooled
+    #        feature (same tail, applied to a real forward pass instead of
+    #        a reconstructed one)                          -> TEST vectors
+    #   11.  classification (unchanged)
+    # No K-means/histogram step at all for this pipeline -- see
+    # `position_reconstruction.py`'s module docstring for why.
+    # ------------------------------------------------------------------ #
+    def _run_position_cvws_variant(
+        self,
+        approach: str,
+        backend: str,  # "cnn" or "vit"
+        descriptor_paths: Dict[str, str],
+        train_ids: List[str],
+        test_ids: List[str],
+        labels: Dict[str, str],
+        tag: str,
+    ) -> List[dict]:
+        clustering_result, stats = self._umap_hdbscan_and_stats(descriptor_paths, train_ids, labels, tag)
+
+        # n_positions/descriptor_dim: every image contributes the SAME
+        # fixed-size, fixed-order local descriptor set (CNN spatial conv
+        # activations / ViT patch tokens), unlike SIFT's variable-length
+        # keypoint sets -- see `position_reconstruction.py`'s module
+        # docstring. Read from one real descriptor file rather than
+        # hardcoding 196, since it depends on input resolution/backbone.
+        sample = np.load(next(iter(descriptor_paths.values())))
+        n_positions, descriptor_dim = sample.shape
+        classes = sorted({labels[i] for i in train_ids})
+        images_per_class = self.cfg.selection.images_per_class
+        if images_per_class is None:
+            images_per_class = max(1, len(train_ids) // len(classes))
+
+        # --- Real TEST vectors: standard pooled global feature (same tail
+        # the synthetic vectors below go through, applied to a real
+        # forward pass instead of a reconstructed one) ---
+        if backend == "cnn":
+            global_paths = self._extract_cnn_global(self._preprocessed_paths_for(test_ids))
+            tail_encoder = CnnTailEncoder(
+                self._get_cnn_extractor(),
+                self.cfg.feature_extraction.cnn.layer_name,
+                self.cfg.feature_extraction.cnn.global_pool_layer,
+            )
+        else:
+            global_paths = self._extract_vit_global(self._preprocessed_paths_for(test_ids))
+            tail_encoder = ViTTailEncoder(self._get_vit_extractor())
+        X_test = np.stack([np.load(global_paths[i]) for i in test_ids])
+        y_test = np.array([labels[i] for i in test_ids])
+
+        all_rows: List[dict] = []
+        for strategy_name in self.cfg.selection.strategies:
+            strategy = build_strategy(strategy_name)
+            top_n = self.cfg.selection.position_top_n
+            h_selection = self.cfg.section_hash("selection", "vocabulary", "feature_extraction")
+
+            selection_dir = ensure_dir(Path(self.cfg.paths.output_dir) / "selection")
+            audit_path = (
+                selection_dir / f"{self.cfg.dataset_name}_{tag}_strategy-{strategy_name}_positional_topn{top_n}.json"
+            )
+            synthetic_dir = ensure_dir(Path(self.cfg.paths.output_dir) / "reconstructed_vectors")
+            synthetic_path = (
+                synthetic_dir
+                / f"{self.cfg.dataset_name}_{tag}_strategy-{strategy_name}_topn{top_n}_y{images_per_class}.npz"
+            )
+
+            def _compute_and_persist_synthetic(
+                strategy=strategy, top_n=top_n, audit_path=audit_path, synthetic_path=synthetic_path
+            ):
+                position_words = select_all_position_words(
+                    strategy, clustering_result, labels, n_positions, top_n, self.logger
+                )
+                representatives = build_position_representatives(clustering_result, descriptor_paths, position_words)
+                reconstructed = build_reconstructed_images(
+                    position_words, representatives, classes, n_positions, descriptor_dim, images_per_class, self.logger
+                )
+                X_synth_parts, y_synth_parts = [], []
+                for c in classes:
+                    vectors = tail_encoder.encode(reconstructed[c])
+                    X_synth_parts.append(vectors)
+                    y_synth_parts.extend([c] * vectors.shape[0])
+                X_synth = np.concatenate(X_synth_parts, axis=0)
+                y_synth = np.array(y_synth_parts)
+
+                audit_info = {
+                    "strategy": strategy.name,
+                    "position_top_n": top_n,
+                    "images_per_class": images_per_class,
+                    "n_positions": n_positions,
+                    "n_words_selected_per_position_class": {
+                        str(p): {c: len(ids) for c, ids in by_class.items()} for p, by_class in position_words.items()
+                    },
+                }
+                atomic_write_json(audit_path, audit_info)
+                ensure_dir(synthetic_path.parent)
+                tmp_path = synthetic_path.with_suffix(".tmp.npz")
+                np.savez(tmp_path, X=X_synth, y=y_synth)
+                import os
+
+                os.replace(tmp_path, synthetic_path)
+                return X_synth, y_synth
+
+            synthetic = self._step(
+                f"reconstruct_and_encode_{approach}_{strategy_name}", h_selection, _compute_and_persist_synthetic
+            )
+            if synthetic is None:
+                with np.load(synthetic_path) as npz:
+                    synthetic = (npz["X"], npz["y"])
+            X_train, y_train = synthetic
+
+            rows = self._train_and_evaluate(
+                approach,
+                strategy_name,
+                X_train,
+                y_train,
+                X_test,
+                y_test,
+                test_ids,
+                nb_vw="RAS",
+                training_hash=self._training_hash("selection"),
+            )
+            all_rows.extend(rows)
+        return all_rows
+
+    def _preprocessed_paths_for(self, ids: List[str]) -> Dict[str, str]:
+        """Restrict an already-preprocessed id->path mapping to `ids`
+        (used to extract global features for the TEST set only, in
+        `_run_position_cvws_variant`, without re-extracting for the
+        training images the synthetic-image path doesn't need it for)."""
+        preprocessed_dir = Path(self.cfg.paths.output_dir) / "preprocessed" / self.cfg.dataset_name
+        return {i: str(preprocessed_dir / f"{i}.npy") for i in ids}
+
+    def _run_cvws_variants(
+        self,
+        approach: str,
+        descriptor_paths: Dict[str, str],
+        train_ids: List[str],
+        test_ids: List[str],
+        labels: Dict[str, str],
+        tag: str,
+    ) -> List[dict]:
+        # Steps 3-6 (UMAP -> HDBSCAN -> drop noise -> symbolic re-encoding +
+        # per-class cluster stats), shared verbatim with
+        # `_run_position_cvws_variant` -- see `_umap_hdbscan_and_stats`.
+        clustering_result, stats = self._umap_hdbscan_and_stats(descriptor_paths, train_ids, labels, tag)
 
         all_rows: List[dict] = []
         for strategy_name in self.cfg.selection.strategies:
@@ -666,11 +836,24 @@ class PipelineRunner:
                 strategy=strategy, n=n, selection_path=selection_path, candidates_path=candidates_path
             ):
                 # audit_info (per-class selected cluster ids + per-cluster
-                # selection counts) is persisted for interpretability, next
-                # to the actual candidate descriptor matrix fed to step 9.
-                candidate_descriptors, audit_info = select_clusters_and_build_candidates(
-                    clustering_result, stats, strategy, n, descriptor_paths, self.logger
-                )
+                # selection counts/allocations) is persisted for
+                # interpretability, next to the actual candidate descriptor
+                # matrix fed to step 9. `selection.reconstruction_mode`
+                # (2026-09 update, bovw_cvws only -- see
+                # `cvws_clustering.py`'s module docstring) picks between the
+                # original selection_count-based step 8 ("legacy") and the
+                # score-weighted N/|C| allocation ("weighted", default).
+                if self.cfg.selection.reconstruction_mode == "weighted":
+                    pool_size = self.cfg.selection.candidate_pool_size
+                    if pool_size is None:
+                        pool_size = len(clustering_result.image_ids)  # N = surviving training descriptors
+                    candidate_descriptors, audit_info = select_clusters_and_build_weighted_candidates(
+                        clustering_result, stats, strategy, n, pool_size, descriptor_paths, self.logger
+                    )
+                else:
+                    candidate_descriptors, audit_info = select_clusters_and_build_candidates(
+                        clustering_result, stats, strategy, n, descriptor_paths, self.logger
+                    )
                 atomic_write_json(selection_path, audit_info)
                 atomic_write_npy(candidates_path, candidate_descriptors)
                 return candidate_descriptors
