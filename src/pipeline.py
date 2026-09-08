@@ -62,7 +62,14 @@ from src.feature_extraction import CnnExtractor, ViTExtractor, extract_features_
 from src.pipeline_state import PipelineState
 from src.preprocessing import preprocess_dataset
 from src.selection_strategies import build_strategy
-from src.utils.io_utils import atomic_write_json, atomic_write_npy, atomic_write_pickle, ensure_dir, read_pickle
+from src.utils.io_utils import (
+    atomic_write_json,
+    atomic_write_npy,
+    atomic_write_pickle,
+    ensure_dir,
+    path_exists_and_valid,
+    read_pickle,
+)
 from src.utils.logging_utils import log_step, setup_logger
 from src.vocabulary import Vocabulary, build_vocabulary, build_vocabulary_from_descriptors, encode_histograms
 
@@ -162,13 +169,37 @@ class PipelineRunner:
         self._vit_extractor: Optional[ViTExtractor] = None  # === ViT (option B) ===
 
     # ------------------------------------------------------------------ #
-    def _step(self, step_name: str, config_hash: str, fn, *args, **kwargs):
+    def _step(self, step_name: str, config_hash: str, fn, *args, expected_outputs=None, **kwargs):
         """Run `fn(*args, **kwargs)` under checkpointing: skip if a valid
         cached result already exists for this exact config hash, else run,
-        record success/failure, and always log via `log_step`."""
+        record success/failure, and always log via `log_step`.
+
+        `expected_outputs`, if given, is a zero-arg callable returning the
+        list of output file paths this step is supposed to have produced
+        for the *current* dataset contents. On a would-be cache hit, we
+        verify every one of them actually exists on disk before trusting
+        the cache. This guards against the dataset changing (files added,
+        removed, or renamed) after the step was marked done: the config
+        hash alone can't detect that, since it only reflects config
+        values, not the file listing. If any expected output is missing,
+        the cache entry is invalidated and the step is re-run for real
+        instead of silently handing back paths to files that don't exist.
+        """
         if not self.state.should_run(step_name, config_hash):
-            self.logger.info("SKIP (cache hit) | %s", step_name)
-            return None
+            if expected_outputs is not None:
+                missing = [p for p in expected_outputs() if not path_exists_and_valid(p)]
+                if missing:
+                    self.logger.warning(
+                        "Cache hit for step %r (config unchanged) but %d expected "
+                        "output file(s) are missing on disk (e.g. %s). The dataset "
+                        "likely changed (files added/removed) since this step last "
+                        "completed. Invalidating the cached result and re-running.",
+                        step_name, len(missing), missing[0],
+                    )
+                    self.state.invalidate(step_name)
+            if not self.state.should_run(step_name, config_hash):
+                self.logger.info("SKIP (cache hit) | %s", step_name)
+                return None
 
         self.state.mark_running(step_name, config_hash)
         start = time.time()
@@ -204,9 +235,13 @@ class PipelineRunner:
     def _preprocess(self) -> Tuple[Dict[str, str], Dict[str, str]]:
         image_paths, labels = discover_dataset(self.cfg.paths.dataset_dir)
         h = self.cfg.section_hash("preprocessing")
-        preprocessed = self._step("preprocess_dataset", h, preprocess_dataset, image_paths, self.cfg, self.logger)
+        out_dir = Path(self.cfg.paths.output_dir) / "preprocessed" / self.cfg.dataset_name
+        expected = lambda: [str(out_dir / f"{img_id}.npy") for img_id in image_paths]
+        preprocessed = self._step(
+            "preprocess_dataset", h, preprocess_dataset, image_paths, self.cfg, self.logger,
+            expected_outputs=expected,
+        )
         if preprocessed is None:
-            out_dir = Path(self.cfg.paths.output_dir) / "preprocessed" / self.cfg.dataset_name
             preprocessed = {img_id: str(out_dir / f"{img_id}.npy") for img_id in image_paths}
         return preprocessed, labels
 
@@ -222,9 +257,13 @@ class PipelineRunner:
 
     def _extract_sift(self, preprocessed: Dict[str, str]) -> Dict[str, str]:
         h = self.cfg.section_hash("feature_extraction")
-        result = self._step("extract_sift", h, extract_features_dataset, preprocessed, self.cfg, self.logger, "sift")
+        out_dir = Path(self.cfg.paths.output_dir) / "features" / f"{self.cfg.dataset_name}_sift"
+        expected = lambda: [str(out_dir / f"{img_id}.npy") for img_id in preprocessed]
+        result = self._step(
+            "extract_sift", h, extract_features_dataset, preprocessed, self.cfg, self.logger, "sift",
+            expected_outputs=expected,
+        )
         if result is None:
-            out_dir = Path(self.cfg.paths.output_dir) / "features" / f"{self.cfg.dataset_name}_sift"
             result = {img_id: str(out_dir / f"{img_id}.npy") for img_id in preprocessed}
         return result
 
@@ -234,6 +273,8 @@ class PipelineRunner:
         (cnn_bovw, cnn_bovw_cvws)."""
         layer = self.cfg.feature_extraction.cnn.layer_name
         h = self.cfg.section_hash("feature_extraction")
+        out_dir = Path(self.cfg.paths.output_dir) / "features" / f"{self.cfg.dataset_name}_googlenet_{layer}"
+        expected = lambda: [str(out_dir / f"{img_id}.npy") for img_id in preprocessed]
         result = self._step(
             "extract_cnn_local",
             h,
@@ -243,9 +284,9 @@ class PipelineRunner:
             self.logger,
             "cnn_local",
             self._get_cnn_extractor(),
+            expected_outputs=expected,
         )
         if result is None:
-            out_dir = Path(self.cfg.paths.output_dir) / "features" / f"{self.cfg.dataset_name}_googlenet_{layer}"
             result = {img_id: str(out_dir / f"{img_id}.npy") for img_id in preprocessed}
         return result
 
@@ -254,6 +295,8 @@ class PipelineRunner:
         raw end-to-end CNN approach (cnn_end_to_end) — no BoVW step."""
         layer = self.cfg.feature_extraction.cnn.global_pool_layer
         h = self.cfg.section_hash("feature_extraction")
+        out_dir = Path(self.cfg.paths.output_dir) / "features" / f"{self.cfg.dataset_name}_googlenet_{layer}"
+        expected = lambda: [str(out_dir / f"{img_id}.npy") for img_id in preprocessed]
         result = self._step(
             "extract_cnn_global",
             h,
@@ -263,9 +306,9 @@ class PipelineRunner:
             self.logger,
             "cnn_global",
             self._get_cnn_extractor(),
+            expected_outputs=expected,
         )
         if result is None:
-            out_dir = Path(self.cfg.paths.output_dir) / "features" / f"{self.cfg.dataset_name}_googlenet_{layer}"
             result = {img_id: str(out_dir / f"{img_id}.npy") for img_id in preprocessed}
         return result
 
@@ -278,6 +321,8 @@ class PipelineRunner:
     def _extract_vit_global(self, preprocessed: Dict[str, str]) -> Dict[str, str]:
         backbone = self.cfg.feature_extraction.vit.backbone
         h = self.cfg.section_hash("feature_extraction")
+        out_dir = Path(self.cfg.paths.output_dir) / "features" / f"{self.cfg.dataset_name}_vit_{backbone}"
+        expected = lambda: [str(out_dir / f"{img_id}.npy") for img_id in preprocessed]
         result = self._step(
             "extract_vit_global",
             h,
@@ -288,9 +333,9 @@ class PipelineRunner:
             "vit_global",
             None,  # cnn_extractor (unused here)
             self._get_vit_extractor(),
+            expected_outputs=expected,
         )
         if result is None:
-            out_dir = Path(self.cfg.paths.output_dir) / "features" / f"{self.cfg.dataset_name}_vit_{backbone}"
             result = {img_id: str(out_dir / f"{img_id}.npy") for img_id in preprocessed}
         return result
     # === fin ViT (option B) ================================================
@@ -302,6 +347,8 @@ class PipelineRunner:
     def _extract_vit_local(self, preprocessed: Dict[str, str]) -> Dict[str, str]:
         backbone = self.cfg.feature_extraction.vit.backbone
         h = self.cfg.section_hash("feature_extraction")
+        out_dir = Path(self.cfg.paths.output_dir) / "features" / f"{self.cfg.dataset_name}_vit_{backbone}_local"
+        expected = lambda: [str(out_dir / f"{img_id}.npy") for img_id in preprocessed]
         result = self._step(
             "extract_vit_local",
             h,
@@ -312,9 +359,9 @@ class PipelineRunner:
             "vit_local",
             None,  # cnn_extractor (unused here)
             self._get_vit_extractor(),
+            expected_outputs=expected,
         )
         if result is None:
-            out_dir = Path(self.cfg.paths.output_dir) / "features" / f"{self.cfg.dataset_name}_vit_{backbone}_local"
             result = {img_id: str(out_dir / f"{img_id}.npy") for img_id in preprocessed}
         return result
     # === fin ViT (cvws) ======================================================

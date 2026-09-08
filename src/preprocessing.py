@@ -79,17 +79,24 @@ def preprocess_dataset(
         batch_ids = ids[start : start + batch_size]
         for image_id in batch_ids:
             out_path = out_dir / f"{image_id}.npy"
-            outputs[image_id] = str(out_path)
             if path_exists_and_valid(out_path):
+                outputs[image_id] = str(out_path)
                 n_skipped += 1
                 continue
             src_path = image_paths[image_id]
             image = cv2.imread(src_path, cv2.IMREAD_COLOR)
             if image is None:
-                logger.error("Could not read image %s at %s, skipping", image_id, src_path)
+                # Do NOT register this id in `outputs`: registering a path
+                # that was never written would let a downstream step (which
+                # trusts this dict blindly) try to np.load() a file that
+                # doesn't exist. Leaving it out instead drops this image
+                # cleanly from every later stage (feature extraction,
+                # vocabulary, classification), with a clear reason logged.
+                logger.error("Could not read image %s at %s, excluding it from this run", image_id, src_path)
                 continue
             processed = preprocess_image(image, p_cfg)
             atomic_write_npy(out_path, processed)
+            outputs[image_id] = str(out_path)
             n_done += 1
 
     logger.info("Preprocessing complete: %d processed, %d skipped (cache hit)", n_done, n_skipped)

@@ -111,6 +111,20 @@ class PipelineState:
         )
         self._save()
 
+    def invalidate(self, step_name: str) -> None:
+        """Force a step back to "needs to run": drop its record entirely so
+        the next `should_run` call returns True regardless of config hash.
+
+        Used when a step's cache hit turns out to be untrustworthy -- e.g.
+        its config hash still matches, but one or more of its expected
+        output files are missing on disk (typically because the dataset
+        gained/lost files after the step was marked done). A no-op if the
+        step has no recorded state.
+        """
+        if step_name in self.steps:
+            del self.steps[step_name]
+            self._save()
+
     def mark_done(self, step_name: str, duration_seconds: float) -> None:
         rec = self.steps[step_name]
         rec.status = StepStatus.DONE
