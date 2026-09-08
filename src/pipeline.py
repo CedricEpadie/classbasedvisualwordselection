@@ -71,7 +71,7 @@ from src.utils.io_utils import (
     read_pickle,
 )
 from src.utils.logging_utils import log_step, setup_logger
-from src.vocabulary import Vocabulary, build_vocabulary, build_vocabulary_from_descriptors, encode_histograms
+from src.vocabulary import Vocabulary, VocabularyStats, build_vocabulary, build_vocabulary_from_descriptors, encode_histograms
 
 # Every approach the framework knows how to run, in a stable display order.
 # Exposed here (rather than only inside ApproachesConfig) so the CLI's
